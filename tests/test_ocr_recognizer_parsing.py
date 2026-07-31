@@ -91,14 +91,14 @@ def test_ocr_accepts_huge_python_integer_coordinates() -> None:
     page = make_ocr_page(
         texts=("大坐标",),
         scores=(0.9,),
-        boxes=((huge_coordinate, 0, huge_coordinate, 1),),
+        boxes=((huge_coordinate, 0, huge_coordinate + 1, 1),),
     )
 
     result = OCRRecognizer(FakeOCREngine([page])).recognize(
         Image.new("RGB", (1, 1))
     )
 
-    assert result[0]["bbox"] == (huge_coordinate, 0, huge_coordinate, 1)
+    assert result[0]["bbox"] == (huge_coordinate, 0, huge_coordinate + 1, 1)
     assert all(type(value) is int for value in result[0]["bbox"])
 
 
@@ -147,6 +147,25 @@ def test_ocr_returns_empty_list_for_page_without_text() -> None:
     )
 
     assert result == []
+
+
+def test_ocr_returns_empty_list_when_both_position_fields_are_empty() -> None:
+    page = make_ocr_page(texts=(), scores=(), boxes=())
+    page["rec_polys"] = ()
+
+    result = OCRRecognizer(FakeOCREngine([page])).recognize(
+        Image.new("RGB", (1, 1))
+    )
+
+    assert result == []
+
+
+def test_ocr_rejects_empty_text_with_nonempty_secondary_positions() -> None:
+    page = make_ocr_page(texts=(), scores=(), boxes=())
+    page["rec_polys"] = (((1, 2), (3, 4)),)
+
+    with pytest.raises(OCRRecognitionError):
+        OCRRecognizer(FakeOCREngine([page])).recognize(Image.new("RGB", (1, 1)))
 
 
 def test_ocr_returns_empty_list_for_flat_empty_numpy_boxes() -> None:
@@ -252,7 +271,10 @@ def test_ocr_rejects_text_and_score_length_mismatch() -> None:
 def test_ocr_rejects_text_without_position() -> None:
     page = {"rec_texts": ("一",), "rec_scores": (0.9,)}
 
-    with pytest.raises(OCRRecognitionError):
+    with pytest.raises(
+        OCRRecognitionError,
+        match="^OCR 结果项缺少文字位置字段$",
+    ):
         OCRRecognizer(FakeOCREngine([page])).recognize(Image.new("RGB", (1, 1)))
 
 
@@ -260,8 +282,34 @@ def test_ocr_rejects_non_mapping_page() -> None:
     engine = FakeOCREngine()
     engine.pages = [object()]  # type: ignore[list-item] - 验证运行时结构校验
 
-    with pytest.raises(OCRRecognitionError):
+    with pytest.raises(OCRRecognitionError, match="^OCR 结果项必须是映射$"):
         OCRRecognizer(engine).recognize(Image.new("RGB", (1, 1)))
+
+
+@pytest.mark.parametrize(
+    ("field_name", "message"),
+    [
+        pytest.param(
+            "rec_texts",
+            "OCR 结果项缺少 rec_texts",
+            id="missing-rec-texts",
+        ),
+        pytest.param(
+            "rec_scores",
+            "OCR 结果项缺少 rec_scores",
+            id="missing-rec-scores",
+        ),
+    ],
+)
+def test_ocr_rejects_missing_required_field(
+    field_name: str,
+    message: str,
+) -> None:
+    page = make_ocr_page()
+    del page[field_name]
+
+    with pytest.raises(OCRRecognitionError, match=f"^{message}$"):
+        OCRRecognizer(FakeOCREngine([page])).recognize(Image.new("RGB", (1, 1)))
 
 
 def test_ocr_rejects_non_string_text() -> None:
@@ -324,6 +372,20 @@ def test_ocr_rejects_reversed_box(box: tuple[int, int, int, int]) -> None:
 
 
 @pytest.mark.parametrize(
+    "box",
+    [
+        pytest.param((1, 2, 1, 5), id="zero-width"),
+        pytest.param((1, 2, 4, 2), id="zero-height"),
+    ],
+)
+def test_ocr_rejects_zero_area_box(box: tuple[int, int, int, int]) -> None:
+    page = make_ocr_page(boxes=(box,))
+
+    with pytest.raises(OCRRecognitionError):
+        OCRRecognizer(FakeOCREngine([page])).recognize(Image.new("RGB", (1, 1)))
+
+
+@pytest.mark.parametrize(
     "polygon",
     [
         pytest.param((), id="empty"),
@@ -331,6 +393,21 @@ def test_ocr_rejects_reversed_box(box: tuple[int, int, int, int]) -> None:
     ],
 )
 def test_ocr_rejects_invalid_polygon(polygon: object) -> None:
+    page = make_ocr_page(boxes=None)
+    page["rec_polys"] = (polygon,)
+
+    with pytest.raises(OCRRecognitionError):
+        OCRRecognizer(FakeOCREngine([page])).recognize(Image.new("RGB", (1, 1)))
+
+
+@pytest.mark.parametrize(
+    "polygon",
+    [
+        pytest.param(((1, 2), (1, 5)), id="zero-width"),
+        pytest.param(((1, 2), (4, 2)), id="zero-height"),
+    ],
+)
+def test_ocr_rejects_zero_area_polygon(polygon: object) -> None:
     page = make_ocr_page(boxes=None)
     page["rec_polys"] = (polygon,)
 

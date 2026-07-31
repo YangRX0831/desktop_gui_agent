@@ -102,8 +102,8 @@ def _parse_box(value: object) -> tuple[int, int, int, int]:
     top = _read_coordinate(coordinates[1], "rec_boxes")
     right = _read_coordinate(coordinates[2], "rec_boxes")
     bottom = _read_coordinate(coordinates[3], "rec_boxes")
-    if left > right or top > bottom:
-        _raise_structure_error("rec_boxes 坐标顺序无效")
+    if left >= right or top >= bottom:
+        _raise_structure_error("rec_boxes 必须具有有效顺序和非零面积")
     return left, top, right, bottom
 
 
@@ -120,12 +120,13 @@ def _parse_polygon(value: object) -> tuple[int, int, int, int]:
             _raise_structure_error("rec_polys 的点必须包含两个坐标")
         x_coordinates.append(_read_coordinate(pair[0], "rec_polys"))
         y_coordinates.append(_read_coordinate(pair[1], "rec_polys"))
-    return (
-        min(x_coordinates),
-        min(y_coordinates),
-        max(x_coordinates),
-        max(y_coordinates),
-    )
+    left = min(x_coordinates)
+    top = min(y_coordinates)
+    right = max(x_coordinates)
+    bottom = max(y_coordinates)
+    if left >= right or top >= bottom:
+        _raise_structure_error("rec_polys 生成的边界框必须具有非零面积")
+    return left, top, right, bottom
 
 
 def _parse_confidence(value: object) -> float:
@@ -152,11 +153,11 @@ def _validate_empty_positions(value: object, field_name: str) -> None:
 
 def _parse_page(page: object) -> list[OCRResult]:
     if not isinstance(page, Mapping):
-        _raise_structure_error("页面结果必须是映射")
+        _raise_structure_error("OCR 结果项必须是映射")
     if "rec_texts" not in page:
-        _raise_structure_error("页面缺少 rec_texts")
+        _raise_structure_error("OCR 结果项缺少 rec_texts")
     if "rec_scores" not in page:
-        _raise_structure_error("页面缺少 rec_scores")
+        _raise_structure_error("OCR 结果项缺少 rec_scores")
 
     texts = _read_sequence(page["rec_texts"], "rec_texts", 1)
     scores = _read_sequence(page["rec_scores"], "rec_scores", 1)
@@ -169,18 +170,16 @@ def _parse_page(page: object) -> list[OCRResult]:
     if not texts:
         # rec_texts 为空时位置字段也必须为空；空 NumPy 数组可以使用不同
         # 维度，但只要包含位置数据，就视为字段长度不一致。
-        if boxes_value is not None:
-            _validate_empty_positions(boxes_value, "rec_boxes")
-        else:
-            polygons_value = page.get("rec_polys")
-            if polygons_value is not None:
-                _validate_empty_positions(polygons_value, "rec_polys")
+        for field_name in ("rec_boxes", "rec_polys"):
+            positions_value = page.get(field_name)
+            if positions_value is not None:
+                _validate_empty_positions(positions_value, field_name)
         return []
 
     use_polygons = boxes_value is None
     if use_polygons:
         if "rec_polys" not in page:
-            _raise_structure_error("页面缺少文字位置字段")
+            _raise_structure_error("OCR 结果项缺少文字位置字段")
         positions = _read_sequence(page["rec_polys"], "rec_polys", 3)
     else:
         positions = _read_sequence(boxes_value, "rec_boxes", 2)

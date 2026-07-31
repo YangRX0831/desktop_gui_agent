@@ -153,7 +153,7 @@ class _WindowsUnicodeTextBackend:
     def send(self, code_units: tuple[int, ...]) -> None:
         # KEYEVENTF_UNICODE 按 UTF-16 code unit 发送，绕过键盘布局和
         # Caps Lock；每个 code unit 都需要成对的按下与释放事件。
-        # 非 BMP 字符会形成代理对和四个事件，目前仅有模拟测试证据。
+        # 非 BMP 字符会编码为一对 UTF-16 代理项，因此生成四个输入事件。
         events = tuple(
             _Input(
                 input_type=_INPUT_KEYBOARD,
