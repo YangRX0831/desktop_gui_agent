@@ -192,7 +192,7 @@ class MouseController:
             raise MouseOperationError("无法初始化鼠标后端") from exc
 
     def move_to(self, x: int, y: int) -> None:
-        """移动鼠标到虚拟桌面归一化坐标。
+        """移动鼠标到相对虚拟桌面左上角的整数像素坐标。
 
         Args:
             x: 相对虚拟桌面左上角的水平坐标。
@@ -217,7 +217,7 @@ class MouseController:
         y: int | None = None,
         button: str = "left",
     ) -> None:
-        """在当前位置或指定归一化坐标单击鼠标。
+        """在当前位置或相对虚拟桌面左上角的像素坐标单击鼠标。
 
         Args:
             x: 可选的虚拟桌面水平坐标。
@@ -239,7 +239,7 @@ class MouseController:
         x: int | None = None,
         y: int | None = None,
     ) -> None:
-        """在当前位置或指定归一化坐标单击鼠标右键。
+        """在当前位置或相对虚拟桌面左上角的像素坐标单击鼠标右键。
 
         Args:
             x: 可选的虚拟桌面水平坐标。
@@ -259,7 +259,7 @@ class MouseController:
         x: int | None = None,
         y: int | None = None,
     ) -> None:
-        """在当前位置或指定归一化坐标双击鼠标左键。
+        """在当前位置或相对虚拟桌面左上角的像素坐标双击鼠标左键。
 
         Args:
             x: 可选的虚拟桌面水平坐标。
@@ -315,8 +315,8 @@ class MouseController:
         )
         self._run_backend("按下拖拽左键", lambda: self._backend.press("left"))
 
-        # 按下成功后无论拖拽是否失败都尝试释放；释放失败仅在没有更早
-        # 主异常时成为最终异常，从而保留调用方最需要的初始失败原因。
+        # 按下成功后无论拖拽是否失败都尝试释放；释放失败仅在没有原始
+        # 拖拽异常时向上抛出，避免覆盖最先发生的错误。
         primary_error: MouseOperationError | None = None
         try:
             self._perform_drag(

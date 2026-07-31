@@ -37,13 +37,13 @@ class OCRPredictor(Protocol):
         self,
         image: np.ndarray,
     ) -> Iterable[Mapping[str, object]]:
-        """识别图像并返回分页结果。
+        """识别图像并返回可迭代的原始结果。
 
         Args:
             image: BGR 顺序的三通道图像数组。
 
         Returns:
-            按页面产生的 OCR 原始结果。
+            按推理引擎顺序产生的 OCR 原始结果。
         """
 
 
@@ -163,12 +163,12 @@ def _parse_page(page: object) -> list[OCRResult]:
     if len(texts) != len(scores):
         _raise_structure_error("rec_texts 与 rec_scores 长度不一致")
 
-    # PaddleOCR 的结果可能同时包含矩形和多边形；矩形存在时保持优先，
-    # 只有字段缺失才回退多边形，避免同一页产生两种不确定解释。
+    # rec_boxes 和 rec_polys 同时存在时优先使用 rec_boxes，保证同一
+    # 结果只采用一种边界框计算规则。
     boxes_value = page.get("rec_boxes")
     if not texts:
-        # 合法空页允许位置字段使用不同维度的零长度容器；非空位置仍是
-        # 字段长度损坏，不能静默降级为“未识别到文字”。
+        # rec_texts 为空时位置字段也必须为空；空 NumPy 数组可以使用不同
+        # 维度，但只要包含位置数据，就视为字段长度不一致。
         if boxes_value is not None:
             _validate_empty_positions(boxes_value, "rec_boxes")
         else:
@@ -231,7 +231,7 @@ class OCRRecognizer:
             image: 待识别的 Pillow 图像。
 
         Returns:
-            按页面和识别顺序展开的 OCR 结果。
+            按推理引擎返回顺序整理后的 OCR 结果。
 
         Raises:
             TypeError: 输入不是 Pillow 图像。

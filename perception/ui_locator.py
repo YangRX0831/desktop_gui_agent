@@ -1,4 +1,4 @@
-"""提供调用方 UI 元素的图像标注功能。"""
+"""在图像上标注调用方提供的 UI 元素。"""
 
 import logging
 from collections.abc import Mapping
@@ -150,8 +150,8 @@ def _label_position(
     label_width = text_width + 2 * _LABEL_PADDING
     label_height = text_height + 2 * _LABEL_PADDING
 
-    # 标签优先位于元素上方以减少遮挡；顶部空间不足时回退框内，同时
-    # 将背景起点和边界限制在画布中，避免标签整体落到图像之外。
+    # 标签优先绘制在元素上方；顶部空间不足时移入元素框内。同时限制
+    # 标签背景矩形的范围，避免其超出图像边界。
     x1, y1, _, _ = bbox
     label_x = min(x1, max(image.width - label_width, 0))
     preferred_y = y1 - _LABEL_GAP - label_height

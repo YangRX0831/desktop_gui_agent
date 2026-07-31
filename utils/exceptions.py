@@ -1,4 +1,4 @@
-"""定义桌面 GUI 智能体的业务异常。"""
+"""定义桌面感知与控制模块使用的异常类型。"""
 
 
 class ScreenCaptureError(RuntimeError):

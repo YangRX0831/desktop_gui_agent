@@ -232,8 +232,8 @@ def _log_safe_exception(
     safe_metadata = "" if not metadata else ", ".join(
         f"{name}={value}" for name, value in metadata.items()
     )
-    # 仅保留基础文件名、函数名和行号用于定位；异常正文、绝对路径和
-    # 完整 traceback 均不进入日志，避免输入内容随 backend 异常泄露。
+    # 只记录筛选后的操作元数据、异常类型、基础文件名、函数名和行号；
+    # 不记录异常正文、绝对路径、完整堆栈或用户输入内容。
     logger.error(
         "%s：%s异常类型=%s，文件=%s，函数=%s，行号=%d",
         message,
@@ -263,9 +263,9 @@ def _validate_delay(value: object, name: str) -> float:
 class KeyboardController:
     """执行键盘输入、按键、快捷键和滚动操作。
 
-    首版不保证线程安全，调用方应串行调用。``press`` 只负责按下，
-    ``release`` 只负责释放，调用方负责配对。完全模拟测试不能证明
-    真实平台或目标应用兼容性。
+    该类不保证线程安全，应由调用方串行使用。``press`` 只负责按下按键，
+    ``release`` 只负责释放按键；二者独立调用时，调用方需要保证正确
+    配对。
     """
 
     def __init__(
@@ -532,16 +532,16 @@ class KeyboardController:
             raise KeyboardOperationError("当前后端不支持批准的命名键") from exc
 
     def _build_type_actions(self, text: str) -> list[_TypeAction]:
-        # 在构造任何动作前先完成 surrogate 合法性校验，避免孤立项之前的合法
-        # 前缀已经产生输入，留下无法回滚的部分副作用。
+        # 先检查整段文本是否包含孤立的 UTF-16 代理项，避免输入到一半
+        # 才发现错误，造成部分文本已经写入且无法回滚。
         for character in text:
             code_point = ord(character)
             if 0xD800 <= code_point <= 0xDFFF:
                 logger.error("type 包含孤立 UTF-16 代理项")
                 raise ValueError("text 包含孤立 UTF-16 代理项")
 
-        # Tab、CR 和 LF 保留物理按键语义；普通 Windows 文本走 Unicode
-        # backend，不读取或修改 Caps Lock，也不擅自合并 CRLF。
+        # Tab 使用 Tab 键，CR 和 LF 分别使用 Enter 键处理；因此 CRLF
+        # 会产生两次 Enter，其他 Windows 文本通过 Unicode 后端发送。
         actions: list[_TypeAction] = []
         for character in text:
             if character == "\t":
@@ -612,8 +612,8 @@ class KeyboardController:
             raise KeyboardOperationError("Windows 文本输入失败") from exc
 
     def _get_text_backend(self) -> _TextBackend:
-        # 仅在 Windows 普通文本首次输入时创建 backend，控制字符和其他
-        # 平台路径不会因模块导入或控制器构造而触碰 user32。
+        # 仅在 Windows 首次输入普通文本时创建该后端；模块导入、控制器
+        # 初始化和控制字符输入都不会加载 user32。
         if self._text_backend is None:
             try:
                 self._text_backend = _create_windows_text_backend()
@@ -646,7 +646,7 @@ class KeyboardController:
                 raise ValueError("hotkey 不允许重复键")
 
     def _cleanup_pressed(self, pressed: list[object]) -> None:
-        # 清理只尽力释放已按下键；清理异常单独记录但不能覆盖主 press 异常。
+        # 尽力逆序释放已按下键；释放失败不能覆盖原始按键异常。
         for index, resolved in enumerate(reversed(pressed)):
             try:
                 self._keyboard.release(resolved)
