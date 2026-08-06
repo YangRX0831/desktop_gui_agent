@@ -70,7 +70,21 @@ class Qwen2VLLocalBackend:
         min_visual_tokens: int = 256,
         max_visual_tokens: int = 512,
     ) -> None:
-        """保存并验证本地模型调用配置，不加载模型。"""
+        """保存并验证本地模型调用配置，不加载模型。
+
+        Args:
+            model_dir: 本地 OpenVINO 模型目录。
+            max_new_tokens: 单次生成的最大新 token 数。
+            min_visual_tokens: 图像缩放后的最小视觉 token 数量。
+            max_visual_tokens: 图像缩放后的最大视觉 token 数量。
+
+        Raises:
+            TypeError: 配置参数类型不合法。
+            ValueError: 配置值越界、视觉 token 范围不合法，或模型目录
+                不存在或不是目录。
+
+        构造阶段只验证配置与路径，不加载模型 pipeline；模型保持延迟加载。
+        """
         if not isinstance(model_dir, (str, Path)):
             raise TypeError("model_dir 必须是 str 或 Path。")
         if isinstance(model_dir, str) and not model_dir.strip():
@@ -186,7 +200,7 @@ class Qwen2VLLocalBackend:
         return pipeline
 
     def _target_size(self, width: int, height: int) -> tuple[int, int]:
-        """把图像缩放到获批视觉 Token 范围内的 28 像素网格。"""
+        """把图像缩放到配置的视觉 Token 范围和 28 像素有效网格。"""
         # 28 是 Qwen2-VL 视觉输入的有效网格对齐尺度（patch_size=14 ×
         # spatial_merge_size=2）；按该网格缩放图像，在控制视觉 token 数量的
         # 同时保持模型要求的尺寸对齐。
@@ -251,7 +265,24 @@ class Qwen2VLLocalBackend:
             raise ValueError("prompt 不得为空。")
 
     def generate(self, image: Image.Image, prompt: str) -> str:
-        """使用固定 CPU pipeline 生成非空文本。"""
+        """使用固定 CPU pipeline 生成非空文本。
+
+        Args:
+            image: 待理解的 PIL 图像。
+            prompt: 非空提示词文本。
+
+        Returns:
+            模型生成的非空文本。
+
+        Raises:
+            TypeError: image 或 prompt 类型不合法。
+            ValueError: prompt 为空。
+            LocalModelLoadError: 本地模型加载失败。
+            LocalModelInferenceError: 图像处理或推理失败。
+            LocalModelOutputError: 模型未返回可用的非空文本。
+
+        首次调用在需要时延迟加载本地模型 pipeline，后续调用复用。
+        """
         self._validate_generate_args(image, prompt)
         pipeline = self._load_pipeline()
         try:

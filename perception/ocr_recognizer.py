@@ -46,8 +46,8 @@ def _create_ocr_engine() -> OCRPredictor:
     try:
         module = import_module("paddleocr")
         paddle_ocr = module.PaddleOCR
-        # CPU 推理与检测参数（MKL-DNN、8 线程、736/max）是生产验收配置；
-        # 修改任何一项都必须重新验证 PRD 的准确率与延迟门槛。
+        # 这些 CPU 推理与检测参数（MKL-DNN、8 线程、736/max）共同影响
+        # OCR 的准确率和延迟；修改后应重新进行准确率与性能回归验证。
         engine = paddle_ocr(
             ocr_version="PP-OCRv4",
             lang="ch",

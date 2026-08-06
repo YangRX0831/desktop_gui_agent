@@ -82,7 +82,21 @@ class DashScopeAPIBackend:
         timeout_seconds: float = _DEFAULT_TIMEOUT_SECONDS,
         transport: HTTPTransport | None = None,
     ) -> None:
-        """保存外部 API 配置，不发送请求。"""
+        """保存外部 API 配置并验证基础参数，不发送网络请求。
+
+        Args:
+            api_key: 通义千问 API 密钥，可省略。
+            model: 模型名称，可省略。
+            endpoint: 兼容接口端点地址。
+            timeout_seconds: 单次请求超时秒数。
+            transport: 可注入的同步 HTTP transport；省略时使用 requests。
+
+        Raises:
+            TypeError: 参数类型不合法。
+            ValueError: 参数值不合法。
+
+        构造阶段只保存并验证基础参数，不产生网络请求，也不持久化密钥。
+        """
         if api_key is not None and not isinstance(api_key, str):
             raise TypeError("api_key 必须是 str 或 None。")
         if model is not None and not isinstance(model, str):
@@ -113,7 +127,20 @@ class DashScopeAPIBackend:
         *,
         transport: HTTPTransport | None = None,
     ) -> "DashScopeAPIBackend":
-        """从环境变量创建后端，不读取配置文件或持久化秘密。"""
+        """从环境变量创建后端，不读取配置文件或持久化秘密。
+
+        Args:
+            transport: 可注入的同步 HTTP transport；省略时使用 requests。
+
+        Returns:
+            DashScopeAPIBackend 实例。
+
+        Raises:
+            DashScopeAPIConfigurationError: 环境变量值无法转换为合法配置。
+
+        本方法只读取指定的环境变量，不读取配置文件，不持久化 secret，
+        本身不发送网络请求。
+        """
         timeout_text = os.environ.get(_TIMEOUT_ENV)
         timeout_seconds = _DEFAULT_TIMEOUT_SECONDS
         if timeout_text is not None:
@@ -281,7 +308,26 @@ class DashScopeAPIBackend:
         return response
 
     def generate(self, image: Image.Image, prompt: str) -> str:
-        """执行一次通义千问开放平台请求并返回统一文本。"""
+        """执行一次通义千问开放平台请求并返回统一文本。
+
+        Args:
+            image: 待发送的 PIL 图像。
+            prompt: 非空提示词文本。
+
+        Returns:
+            API 返回的非空文本。
+
+        Raises:
+            TypeError: image 或 prompt 类型不合法。
+            ValueError: prompt 为空。
+            DashScopeAPIConfigurationError: 配置缺失或不满足安全约束。
+            DashScopeAPIRetryableError: 临时性 API 故障。
+            DashScopeAPINonRetryableError: 不可重试的请求或响应错误。
+
+        配置与图像编码通过后，本方法会向经验证的 HTTPS endpoint 发送
+        至多一次同步请求；重定向被禁用。backend 自身不进行 retry，
+        重试策略由上层 ModelClient 负责。
+        """
         self._validate_generate_args(image, prompt)
         self._validate_configuration()
         response = self._post(self._payload(image, prompt))
