@@ -3,8 +3,7 @@
 import logging
 from collections.abc import Callable
 
-from utils.exceptions import KeyboardOperationError
-from utils.exceptions import MouseOperationError
+from utils.exceptions import KeyboardOperationError, MouseOperationError
 from utils.safe_logging import log_safe_exception
 
 logger = logging.getLogger(__name__)

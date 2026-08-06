@@ -1,6 +1,9 @@
 """提供桌面屏幕截图功能。"""
 
+import atexit
 import logging
+import threading
+from collections.abc import Callable
 
 import mss
 from mss.exception import ScreenShotError as MssScreenShotError
@@ -11,13 +14,50 @@ from utils.safe_logging import log_safe_exception
 
 logger = logging.getLogger(__name__)
 
+# 模块级复用单个 MSS 实例：每次新建实例有明显开销，且进程退出时应释放
+# 底层句柄；共享实例必须用可重入锁串行化并发截图。
+_mss_instance: mss.MSS | None = None
+_mss_lock = threading.RLock()
 
-def _create_mss_instance() -> object:
+
+def _create_mss_instance() -> mss.MSS:
     try:
-        factory = mss.MSS
+        factory: type[mss.MSS] | Callable[[], mss.MSS] = mss.MSS
     except AttributeError:
         factory = mss.mss
     return factory()
+
+
+def _get_mss_instance_unlocked() -> mss.MSS:
+    global _mss_instance
+
+    if _mss_instance is None:
+        _mss_instance = _create_mss_instance()
+    return _mss_instance
+
+
+def _close_mss_instance_unlocked() -> None:
+    global _mss_instance
+
+    # 无论正常清理还是 grab 失败后的恢复路径，都先清空引用再 close，
+    # 保证下一次调用能够重新创建实例。
+    instance = _mss_instance
+    _mss_instance = None
+    if instance is None:
+        return
+    try:
+        instance.close()
+    except (AttributeError, MssScreenShotError, OSError) as exc:
+        log_safe_exception(logger, "屏幕截图资源清理失败", exc)
+
+
+def _cleanup_mss_instance() -> None:
+    """释放当前进程中延迟创建的 MSS 资源。"""
+    with _mss_lock:
+        _close_mss_instance_unlocked()
+
+
+atexit.register(_cleanup_mss_instance)
 
 
 def _validate_screen_id(screen_id: int) -> None:
@@ -90,7 +130,8 @@ def capture_screen(
     _validate_screen_id(screen_id)
 
     try:
-        with _create_mss_instance() as screen_capture:
+        with _mss_lock:
+            screen_capture = _get_mss_instance_unlocked()
             monitors = screen_capture.monitors
             if screen_id >= len(monitors):
                 logger.error(
@@ -122,6 +163,9 @@ def capture_screen(
                 }
             screenshot = screen_capture.grab(capture_area)
     except (AttributeError, MssScreenShotError, OSError) as exc:
+        # grab 失败后关闭并清空共享实例，使下一次调用可以重新初始化。
+        with _mss_lock:
+            _close_mss_instance_unlocked()
         log_safe_exception(logger, "屏幕截图失败", exc)
         raise ScreenCaptureError(
             f"无法截取屏幕：screen_id={screen_id}, region={region!r}"
@@ -130,7 +174,7 @@ def capture_screen(
     return Image.frombytes(
         "RGB",
         screenshot.size,
-        screenshot.bgra,
+        screenshot.raw,
         "raw",
         "BGRX",
     )

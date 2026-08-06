@@ -6,19 +6,19 @@
 import logging
 import math
 from collections import defaultdict
-from typing import Any
-from typing import cast
+from typing import Any, cast
 
 import pytest
 
 from control import mouse_controller
+from tests.mouse_test_support import (
+    SENSITIVE_LOG_PARTS,
+    SafeEnvironment,
+    _controller,
+    formatted_log_output,
+    safe_environment,
+)
 from utils.exceptions import MouseOperationError
-
-from tests.mouse_test_support import SENSITIVE_LOG_PARTS
-from tests.mouse_test_support import SafeEnvironment
-from tests.mouse_test_support import _controller
-from tests.mouse_test_support import formatted_log_output
-from tests.mouse_test_support import safe_environment
 
 
 class FakeBackend:
@@ -376,11 +376,16 @@ def test_backend_failure_preserves_cause(
     controller = _controller(safe_environment)
 
     if operation == "move_to":
-        call = lambda: controller.move_to(1, 2)
+
+        def call() -> None:
+            controller.move_to(1, 2)
+
     elif operation == "click":
         call = controller.click
     else:
-        call = lambda: controller.drag_from_to(0, 0, 1, 1, 0)
+
+        def call() -> None:
+            controller.drag_from_to(0, 0, 1, 1, 0)
 
     with pytest.raises(MouseOperationError) as exc_info:
         call()

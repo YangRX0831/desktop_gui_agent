@@ -12,14 +12,15 @@ from pathlib import Path
 import pytest
 
 from control import keyboard_controller
+from tests.keyboard_test_support import (
+    FakeEnvironment,
+    FakeSendInput,
+    _controller,
+    _keyboard_events,
+    _source,
+    fake_environment,
+)
 from utils.exceptions import KeyboardOperationError
-
-from tests.keyboard_test_support import FakeEnvironment
-from tests.keyboard_test_support import FakeSendInput
-from tests.keyboard_test_support import _controller
-from tests.keyboard_test_support import _keyboard_events
-from tests.keyboard_test_support import _source
-from tests.keyboard_test_support import fake_environment
 
 
 class FakeKey:
@@ -223,9 +224,10 @@ def test_windows_backend_structure_layout_matches_current_windows_abi() -> None:
     expected_keyboard_size = 24 if pointer_size == 8 else 16
     expected_input_size = 40 if pointer_size == 8 else 28
 
-    assert keyboard_controller.ctypes.sizeof(
-        keyboard_controller._KeyboardInput
-    ) == expected_keyboard_size
+    assert (
+        keyboard_controller.ctypes.sizeof(keyboard_controller._KeyboardInput)
+        == expected_keyboard_size
+    )
     assert (
         keyboard_controller.ctypes.sizeof(keyboard_controller._Input)
         == expected_input_size
@@ -335,9 +337,7 @@ def test_formatted_windows_text_log_redacts_sensitive_data(
     controller = _controller(fake_environment)
     stream = io.StringIO()
     handler = logging.StreamHandler(stream)
-    handler.setFormatter(
-        logging.Formatter("%(levelname)s:%(name)s:%(message)s")
-    )
+    handler.setFormatter(logging.Formatter("%(levelname)s:%(name)s:%(message)s"))
     monkeypatch.setattr(keyboard_controller.logger, "propagate", False)
     keyboard_controller.logger.addHandler(handler)
 
@@ -381,9 +381,7 @@ def test_formatted_log_redacts_original_exception_and_character(
     controller = _controller(fake_environment)
     stream = io.StringIO()
     handler = logging.StreamHandler(stream)
-    handler.setFormatter(
-        logging.Formatter("%(levelname)s:%(name)s:%(message)s")
-    )
+    handler.setFormatter(logging.Formatter("%(levelname)s:%(name)s:%(message)s"))
     monkeypatch.setattr(keyboard_controller.logger, "propagate", False)
     keyboard_controller.logger.addHandler(handler)
 

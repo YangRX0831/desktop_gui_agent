@@ -15,8 +15,7 @@ import pytest
 from PIL import Image
 
 from perception.ocr_recognizer import OCRRecognizer
-from utils.exceptions import OCRModelLoadError
-from utils.exceptions import OCRRecognitionError
+from utils.exceptions import OCRModelLoadError, OCRRecognitionError
 
 SENSITIVE_LOG_PARTS = (
     "SENSITIVE_EXCEPTION_MESSAGE",
@@ -106,7 +105,11 @@ def test_ocr_default_engine_uses_cpu() -> None:
         OCRRecognizer()
 
     assert constructor_calls[0]["device"] == "cpu"
-    assert constructor_calls[0]["enable_mkldnn"] is False
+    assert constructor_calls[0]["enable_mkldnn"] is True
+    assert constructor_calls[0]["cpu_threads"] == 8
+    assert constructor_calls[0]["mkldnn_cache_capacity"] == 10
+    assert constructor_calls[0]["text_det_limit_side_len"] == 736
+    assert constructor_calls[0]["text_det_limit_type"] == "max"
 
 
 def test_ocr_default_engine_disables_document_components() -> None:
@@ -123,7 +126,7 @@ def test_ocr_default_engine_disables_document_components() -> None:
     assert constructor_calls[0]["use_doc_orientation_classify"] is False
     assert constructor_calls[0]["use_doc_unwarping"] is False
     assert constructor_calls[0]["use_textline_orientation"] is False
-    assert len(constructor_calls[0]) == 7
+    assert len(constructor_calls[0]) == 11
 
 
 def test_ocr_injected_engine_does_not_import_paddleocr() -> None:
@@ -187,7 +190,7 @@ def test_ocr_input_array_is_uint8_three_channel_and_contiguous() -> None:
 def test_ocr_rejects_non_pillow_input() -> None:
     with pytest.raises(TypeError):
         OCRRecognizer(FakeOCREngine()).recognize(
-            object()  # type: ignore[arg-type] - 验证运行时类型校验
+            object()  # type: ignore[arg-type]  # 验证运行时类型校验
         )
 
 
@@ -309,8 +312,6 @@ def test_ocr_structure_error_does_not_log_recognized_text(
 
     with caplog.at_level(logging.ERROR, logger="perception.ocr_recognizer"):
         with pytest.raises(OCRRecognitionError):
-            OCRRecognizer(FakeOCREngine([page])).recognize(
-                Image.new("RGB", (1, 1))
-            )
+            OCRRecognizer(FakeOCREngine([page])).recognize(Image.new("RGB", (1, 1)))
 
     assert sensitive_text not in caplog.text

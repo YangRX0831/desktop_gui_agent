@@ -9,16 +9,17 @@ import math
 import pytest
 
 from control import keyboard_controller
+from tests.keyboard_test_support import (
+    APPROVED_KEYS,
+    REJECTED_KEYS,
+    FakeEnvironment,
+    FakeKey,
+    FakeKeyboardBackend,
+    FakeScrollBackend,
+    _controller,
+    fake_environment,
+)
 from utils.exceptions import KeyboardOperationError
-
-from tests.keyboard_test_support import APPROVED_KEYS
-from tests.keyboard_test_support import FakeEnvironment
-from tests.keyboard_test_support import FakeKey
-from tests.keyboard_test_support import FakeKeyboardBackend
-from tests.keyboard_test_support import FakeScrollBackend
-from tests.keyboard_test_support import REJECTED_KEYS
-from tests.keyboard_test_support import _controller
-from tests.keyboard_test_support import fake_environment
 
 
 class FakeTextBackend:
@@ -138,9 +139,10 @@ def test_factory_failure_is_wrapped_and_logged_once(
         create_scroll,
     )
 
-    with caplog.at_level(logging.ERROR), pytest.raises(
-        KeyboardOperationError
-    ) as caught:
+    with (
+        caplog.at_level(logging.ERROR),
+        pytest.raises(KeyboardOperationError) as caught,
+    ):
         keyboard_controller.KeyboardController()
 
     assert caught.value.__cause__ is original
@@ -150,9 +152,7 @@ def test_factory_failure_is_wrapped_and_logged_once(
         else ["keyboard", "scroll"]
     )
     assert calls == expected_calls
-    assert sum(
-        record.message.startswith(message) for record in caplog.records
-    ) == 1
+    assert sum(record.message.startswith(message) for record in caplog.records) == 1
 
 
 @pytest.mark.parametrize("key_name", APPROVED_KEYS)
@@ -164,9 +164,7 @@ def test_all_approved_named_keys_are_resolved(
 
     controller.press(key_name)
 
-    assert fake_environment.keyboard.events == [
-        ("press", getattr(FakeKey, key_name))
-    ]
+    assert fake_environment.keyboard.events == [("press", getattr(FakeKey, key_name))]
 
 
 def test_approved_named_keys_match_production_whitelist_exactly() -> None:
@@ -312,9 +310,10 @@ def test_character_key_is_redacted_from_failure(
     )
     controller = _controller(fake_environment)
 
-    with caplog.at_level(logging.ERROR), pytest.raises(
-        KeyboardOperationError
-    ) as caught:
+    with (
+        caplog.at_level(logging.ERROR),
+        pytest.raises(KeyboardOperationError) as caught,
+    ):
         getattr(controller, method_name)(sensitive_character)
 
     output = " ".join(record.message for record in caplog.records)

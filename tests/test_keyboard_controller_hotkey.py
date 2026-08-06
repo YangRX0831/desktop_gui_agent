@@ -8,12 +8,13 @@ from collections import defaultdict
 
 import pytest
 
+from tests.keyboard_test_support import (
+    FakeEnvironment,
+    FakeKey,
+    _controller,
+    fake_environment,
+)
 from utils.exceptions import KeyboardOperationError
-
-from tests.keyboard_test_support import FakeEnvironment
-from tests.keyboard_test_support import FakeKey
-from tests.keyboard_test_support import _controller
-from tests.keyboard_test_support import fake_environment
 
 
 class FakeKeyboardBackend:
@@ -96,15 +97,55 @@ def test_hotkey_success_order_and_delay(
     assert fake_environment.sleeps == [0.1]
 
 
-@pytest.mark.parametrize("keys", [(), ("ctrl",)])
-def test_hotkey_requires_two_keys_without_backend(
+def test_hotkey_single_key_success_order_and_delay(
     fake_environment: FakeEnvironment,
-    keys: tuple[str, ...],
+) -> None:
+    controller = _controller(fake_environment)
+
+    result = controller.hotkey("enter")
+
+    assert result is None
+    assert fake_environment.keyboard.events == [
+        ("press", FakeKey.enter),
+        ("release", FakeKey.enter),
+    ]
+    assert fake_environment.sleeps == [0.1]
+
+
+def test_hotkey_two_key_order_regression(
+    fake_environment: FakeEnvironment,
+) -> None:
+    controller = _controller(fake_environment)
+
+    controller.hotkey("ctrl", "c")
+
+    assert fake_environment.keyboard.events == [
+        ("press", FakeKey.ctrl),
+        ("press", "c"),
+        ("release", "c"),
+        ("release", FakeKey.ctrl),
+    ]
+
+
+def test_hotkey_rejects_zero_keys_without_backend(
+    fake_environment: FakeEnvironment,
 ) -> None:
     controller = _controller(fake_environment)
 
     with pytest.raises(ValueError):
-        controller.hotkey(*keys)
+        controller.hotkey()
+
+    assert fake_environment.keyboard.events == []
+    assert fake_environment.sleeps == []
+
+
+def test_hotkey_rejects_invalid_single_key_without_backend(
+    fake_environment: FakeEnvironment,
+) -> None:
+    controller = _controller(fake_environment)
+
+    with pytest.raises(ValueError):
+        controller.hotkey("invalid")
 
     assert fake_environment.keyboard.events == []
     assert fake_environment.sleeps == []
@@ -155,16 +196,45 @@ def test_hotkey_validates_all_keys_before_backend(
 
 def test_hotkey_first_press_failure_has_no_cleanup(
     fake_environment: FakeEnvironment,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     original = RuntimeError("first press failed")
     fake_environment.keyboard.fail_on("press", 1, original)
     controller = _controller(fake_environment)
 
-    with pytest.raises(KeyboardOperationError) as caught:
-        controller.hotkey("ctrl", "a")
+    with (
+        caplog.at_level(logging.ERROR),
+        pytest.raises(KeyboardOperationError) as caught,
+    ):
+        controller.hotkey("enter")
 
     assert caught.value.__cause__ is original
-    assert fake_environment.keyboard.events == [("press", FakeKey.ctrl)]
+    assert fake_environment.keyboard.events == [("press", FakeKey.enter)]
+    assert "enter" not in caplog.text
+
+
+def test_hotkey_single_release_failure_preserves_cause_and_redacts_key(
+    fake_environment: FakeEnvironment,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    original = RuntimeError("SENSITIVE_RELEASE_FAILURE")
+    fake_environment.keyboard.fail_on("release", 1, original)
+    controller = _controller(fake_environment)
+
+    with (
+        caplog.at_level(logging.ERROR),
+        pytest.raises(KeyboardOperationError) as caught,
+    ):
+        controller.hotkey("密")
+
+    assert caught.value.__cause__ is original
+    assert fake_environment.keyboard.events == [
+        ("press", "密"),
+        ("release", "密"),
+    ]
+    assert fake_environment.sleeps == []
+    assert "密" not in caplog.text
+    assert "SENSITIVE_RELEASE_FAILURE" not in caplog.text
 
 
 def test_hotkey_main_failure_is_logged_once(
@@ -223,9 +293,10 @@ def test_hotkey_press_failure_continues_after_multiple_cleanup_failures(
     fake_environment.keyboard.fail_on("release", 2, second_cleanup)
     controller = _controller(fake_environment)
 
-    with caplog.at_level(logging.ERROR), pytest.raises(
-        KeyboardOperationError
-    ) as caught:
+    with (
+        caplog.at_level(logging.ERROR),
+        pytest.raises(KeyboardOperationError) as caught,
+    ):
         controller.hotkey("ctrl", "shift", "alt", "a")
 
     assert caught.value.__cause__ is main_failure
@@ -245,14 +316,16 @@ def test_hotkey_press_failure_continues_after_multiple_cleanup_failures(
     ]
     assert fake_environment.keyboard.events[4:] == expected_releases
     assert fake_environment.keyboard.counts["release"] == 3
-    assert sum(
-        record.message.startswith("快捷键按下失败")
-        for record in caplog.records
-    ) == 1
-    assert sum(
-        record.message.startswith("快捷键清理释放失败")
-        for record in caplog.records
-    ) == 2
+    assert (
+        sum(record.message.startswith("快捷键按下失败") for record in caplog.records)
+        == 1
+    )
+    assert (
+        sum(
+            record.message.startswith("快捷键清理释放失败") for record in caplog.records
+        )
+        == 2
+    )
     assert fake_environment.sleeps == []
 
 
@@ -266,9 +339,10 @@ def test_hotkey_release_failures_keep_first_cause_and_continue(
     fake_environment.keyboard.fail_on("release", 2, second)
     controller = _controller(fake_environment)
 
-    with caplog.at_level(logging.ERROR), pytest.raises(
-        KeyboardOperationError
-    ) as caught:
+    with (
+        caplog.at_level(logging.ERROR),
+        pytest.raises(KeyboardOperationError) as caught,
+    ):
         controller.hotkey("ctrl", "shift", "a")
 
     assert caught.value.__cause__ is first
@@ -286,14 +360,16 @@ def test_hotkey_release_failures_keep_first_cause_and_continue(
     ]
     assert fake_environment.keyboard.events[3:] == expected_releases
     assert fake_environment.keyboard.counts["release"] == 3
-    assert sum(
-        record.message.startswith("快捷键释放失败")
-        for record in caplog.records
-    ) == 1
-    assert sum(
-        record.message.startswith("快捷键后续释放失败")
-        for record in caplog.records
-    ) == 1
+    assert (
+        sum(record.message.startswith("快捷键释放失败") for record in caplog.records)
+        == 1
+    )
+    assert (
+        sum(
+            record.message.startswith("快捷键后续释放失败") for record in caplog.records
+        )
+        == 1
+    )
     assert fake_environment.sleeps == []
 
 

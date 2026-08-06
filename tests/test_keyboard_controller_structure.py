@@ -10,11 +10,12 @@ from collections import defaultdict
 from pathlib import Path
 
 from control import keyboard_controller
-
-from tests.keyboard_test_support import FakeEnvironment
-from tests.keyboard_test_support import _controller
-from tests.keyboard_test_support import _source
-from tests.keyboard_test_support import fake_environment
+from tests.keyboard_test_support import (
+    FakeEnvironment,
+    _controller,
+    _source,
+    fake_environment,
+)
 
 
 class FakeKey:
@@ -110,14 +111,8 @@ def test_module_has_no_forbidden_top_level_behavior() -> None:
         for statement in tree.body
         if not isinstance(statement, (ast.FunctionDef, ast.ClassDef))
         for node in ast.walk(statement)
-        if (
-            isinstance(node, ast.Name)
-            and node.id in {"Controller", "Listener"}
-        )
-        or (
-            isinstance(node, ast.Attribute)
-            and node.attr in {"Controller", "Listener"}
-        )
+        if (isinstance(node, ast.Name) and node.id in {"Controller", "Listener"})
+        or (isinstance(node, ast.Attribute) and node.attr in {"Controller", "Listener"})
     ]
 
     assert "pynput" not in imported_modules
@@ -133,14 +128,10 @@ def test_module_has_no_forbidden_features() -> None:
         node.id.lower() for node in ast.walk(tree) if isinstance(node, ast.Name)
     }
     attributes = {
-        node.attr.lower()
-        for node in ast.walk(tree)
-        if isinstance(node, ast.Attribute)
+        node.attr.lower() for node in ast.walk(tree) if isinstance(node, ast.Attribute)
     }
     class_names = {
-        node.name.lower()
-        for node in tree.body
-        if isinstance(node, ast.ClassDef)
+        node.name.lower() for node in tree.body if isinstance(node, ast.ClassDef)
     }
     function_names = {
         node.name.lower()
@@ -163,11 +154,7 @@ def test_module_has_no_forbidden_features() -> None:
         "random",
     }
     code_names = (
-        identifiers
-        | attributes
-        | class_names
-        | function_names
-        | imported_modules
+        identifiers | attributes | class_names | function_names | imported_modules
     )
     bool_wrappers = [
         node
@@ -178,9 +165,7 @@ def test_module_has_no_forbidden_features() -> None:
     ]
 
     assert not any(
-        fragment in name
-        for name in code_names
-        for fragment in forbidden_fragments
+        fragment in name for name in code_names for fragment in forbidden_fragments
     )
     assert bool_wrappers == []
 

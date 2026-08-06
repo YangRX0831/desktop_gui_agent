@@ -1,16 +1,11 @@
 """在图像上标注调用方提供的 UI 元素。"""
 
 import logging
-from collections.abc import Mapping
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from types import MappingProxyType
-from typing import Literal
-from typing import TypedDict
-from typing import cast
+from typing import Literal, TypedDict, cast
 
-from PIL import Image
-from PIL import ImageDraw
-from PIL import ImageFont
+from PIL import Image, ImageDraw, ImageFont
 
 logger = logging.getLogger(__name__)
 
@@ -143,7 +138,7 @@ def _label_position(
     bbox: tuple[int, int, int, int],
     font: ImageFont.FreeTypeFont,
     image: Image.Image,
-) -> tuple[int, int, int, int, int, int]:
+) -> tuple[float, float, float, float, float, float]:
     text_bbox = draw.textbbox((0, 0), label, font=font)
     text_width = text_bbox[2] - text_bbox[0]
     text_height = text_bbox[3] - text_bbox[1]

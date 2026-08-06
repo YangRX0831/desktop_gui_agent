@@ -73,21 +73,17 @@ _NAMED_KEYS = frozenset(
 
 
 class _KeyboardBackend(Protocol):
-    def press(self, key: object) -> None:
-        ...
+    def press(self, key: object) -> None: ...
 
-    def release(self, key: object) -> None:
-        ...
+    def release(self, key: object) -> None: ...
 
 
 class _ScrollBackend(Protocol):
-    def scroll(self, dx: int, dy: int) -> None:
-        ...
+    def scroll(self, dx: int, dy: int) -> None: ...
 
 
 class _TextBackend(Protocol):
-    def send(self, code_units: tuple[int, ...]) -> None:
-        ...
+    def send(self, code_units: tuple[int, ...]) -> None: ...
 
 
 class _SendInputCallable(Protocol):
@@ -96,8 +92,7 @@ class _SendInputCallable(Protocol):
         input_count: int,
         inputs: object,
         structure_size: int,
-    ) -> int:
-        ...
+    ) -> int: ...
 
 
 # 下列结构的字段顺序和宽度对应 Windows INPUT ABI；布局变化会导致
@@ -229,8 +224,10 @@ def _log_safe_exception(
         function_name = code.co_name
         line_number = traceback.tb_lineno
 
-    safe_metadata = "" if not metadata else ", ".join(
-        f"{name}={value}" for name, value in metadata.items()
+    safe_metadata = (
+        ""
+        if not metadata
+        else ", ".join(f"{name}={value}" for name, value in metadata.items())
     )
     # 只记录筛选后的操作元数据、异常类型、基础文件名、函数名和行号；
     # 不记录异常正文、绝对路径、完整堆栈或用户输入内容。
@@ -402,19 +399,20 @@ class KeyboardController:
         self._delay(self._action_delay, "release", "动作延迟失败")
 
     def hotkey(self, *keys: str) -> None:
-        """按顺序按下并按相反顺序释放组合键。
+        """按顺序按下并按相反顺序释放一个或多个按键。
 
         Args:
-            *keys: 至少两个互不重复的字符键或命名键。
+            *keys: 至少一个互不重复的字符键或命名键。
 
         Raises:
             TypeError: 任一按键不是字符串。
             ValueError: 按键数量、名称或重复状态无效。
             KeyboardOperationError: 后端按键、释放、清理或延迟失败。
         """
-        if len(keys) < 2:
+        # Agent 没有独立 press 动作，因此单键 hotkey 表示完整按下和释放。
+        if not keys:
             logger.error("hotkey 按键数量不足")
-            raise ValueError("hotkey 至少需要两个键")
+            raise ValueError("hotkey 至少需要一个键")
 
         # 全部键先完成解析和去重，保证无效组合在首次真实按键前失败。
         resolved_keys = [self._parse_key(key, "hotkey")[0] for key in keys]
@@ -468,9 +466,7 @@ class KeyboardController:
                     )
 
         if first_release_error is not None:
-            raise KeyboardOperationError(
-                "快捷键释放失败"
-            ) from first_release_error
+            raise KeyboardOperationError("快捷键释放失败") from first_release_error
 
         self._delay(self._action_delay, "hotkey", "动作延迟失败")
 
@@ -623,9 +619,7 @@ class KeyboardController:
                     exc,
                     {"action": "type", "backend": "windows_unicode"},
                 )
-                raise KeyboardOperationError(
-                    "无法初始化 Windows 文本后端"
-                ) from exc
+                raise KeyboardOperationError("无法初始化 Windows 文本后端") from exc
         return self._text_backend
 
     def _resolve_named_key(self, name: str, action: str) -> object:

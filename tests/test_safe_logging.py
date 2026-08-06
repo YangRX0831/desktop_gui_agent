@@ -24,9 +24,7 @@ def _logger_with_stream() -> tuple[logging.Logger, StringIO, logging.Handler]:
     logger = logging.Logger("safe_logging_test", level=logging.ERROR)
     stream = StringIO()
     handler = logging.StreamHandler(stream)
-    handler.setFormatter(
-        logging.Formatter("%(levelname)s|%(name)s|%(message)s")
-    )
+    handler.setFormatter(logging.Formatter("%(levelname)s|%(name)s|%(message)s"))
     logger.addHandler(handler)
     return logger, stream, handler
 

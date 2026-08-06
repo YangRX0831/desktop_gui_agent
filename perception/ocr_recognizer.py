@@ -2,21 +2,15 @@
 
 import logging
 import math
-from collections.abc import Iterable
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from importlib import import_module
-from numbers import Integral
-from numbers import Real
-from typing import NoReturn
-from typing import Protocol
-from typing import TypedDict
-from typing import cast
+from numbers import Integral, Real
+from typing import NoReturn, Protocol, TypedDict, cast
 
 import numpy as np
 from PIL import Image
 
-from utils.exceptions import OCRModelLoadError
-from utils.exceptions import OCRRecognitionError
+from utils.exceptions import OCRModelLoadError, OCRRecognitionError
 from utils.safe_logging import log_safe_exception
 
 logger = logging.getLogger(__name__)
@@ -52,11 +46,17 @@ def _create_ocr_engine() -> OCRPredictor:
     try:
         module = import_module("paddleocr")
         paddle_ocr = module.PaddleOCR
+        # CPU 推理与检测参数（MKL-DNN、8 线程、736/max）是生产验收配置；
+        # 修改任何一项都必须重新验证 PRD 的准确率与延迟门槛。
         engine = paddle_ocr(
             ocr_version="PP-OCRv4",
             lang="ch",
             device="cpu",
-            enable_mkldnn=False,
+            enable_mkldnn=True,
+            cpu_threads=8,
+            mkldnn_cache_capacity=10,
+            text_det_limit_side_len=736,
+            text_det_limit_type="max",
             use_doc_orientation_classify=False,
             use_doc_unwarping=False,
             use_textline_orientation=False,

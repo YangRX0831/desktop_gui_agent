@@ -48,9 +48,7 @@ def test_ocr_parses_single_result() -> None:
         Image.new("RGB", (1, 1))
     )
 
-    assert result == [
-        {"text": "中文", "bbox": (1, 2, 30, 40), "confidence": 0.95}
-    ]
+    assert result == [{"text": "中文", "bbox": (1, 2, 30, 40), "confidence": 0.95}]
 
 
 def test_ocr_preserves_multiple_bilingual_results_in_order() -> None:
@@ -60,9 +58,7 @@ def test_ocr_preserves_multiple_bilingual_results_in_order() -> None:
         boxes=((1, 2, 3, 4), (5, 6, 7, 8)),
     )
 
-    result = OCRRecognizer(FakeOCREngine([page])).recognize(
-        Image.new("RGB", (1, 1))
-    )
+    result = OCRRecognizer(FakeOCREngine([page])).recognize(Image.new("RGB", (1, 1)))
 
     assert [item["text"] for item in result] == ["中文", "English"]
 
@@ -79,9 +75,7 @@ def test_ocr_returns_python_integer_box_tuple() -> None:
 def test_ocr_accepts_numpy_integer_boxes() -> None:
     page = make_ocr_page(boxes=np.array([[1, 2, 3, 4]], dtype=np.int64))
 
-    result = OCRRecognizer(FakeOCREngine([page])).recognize(
-        Image.new("RGB", (1, 1))
-    )
+    result = OCRRecognizer(FakeOCREngine([page])).recognize(Image.new("RGB", (1, 1)))
 
     assert result[0]["bbox"] == (1, 2, 3, 4)
 
@@ -94,9 +88,7 @@ def test_ocr_accepts_huge_python_integer_coordinates() -> None:
         boxes=((huge_coordinate, 0, huge_coordinate + 1, 1),),
     )
 
-    result = OCRRecognizer(FakeOCREngine([page])).recognize(
-        Image.new("RGB", (1, 1))
-    )
+    result = OCRRecognizer(FakeOCREngine([page])).recognize(Image.new("RGB", (1, 1)))
 
     assert result[0]["bbox"] == (huge_coordinate, 0, huge_coordinate + 1, 1)
     assert all(type(value) is int for value in result[0]["bbox"])
@@ -107,9 +99,7 @@ def test_ocr_falls_back_to_polygons() -> None:
     page["rec_boxes"] = None
     page["rec_polys"] = (((1, 4), (5, 2), (3, 8)),)
 
-    result = OCRRecognizer(FakeOCREngine([page])).recognize(
-        Image.new("RGB", (1, 1))
-    )
+    result = OCRRecognizer(FakeOCREngine([page])).recognize(Image.new("RGB", (1, 1)))
 
     assert result[0]["bbox"] == (1, 2, 5, 8)
 
@@ -125,9 +115,7 @@ def test_ocr_does_not_fall_back_when_boxes_are_invalid() -> None:
 def test_ocr_converts_real_confidence_to_float() -> None:
     page = make_ocr_page(scores=(np.float32(0.75),))
 
-    result = OCRRecognizer(FakeOCREngine([page])).recognize(
-        Image.new("RGB", (1, 1))
-    )
+    result = OCRRecognizer(FakeOCREngine([page])).recognize(Image.new("RGB", (1, 1)))
 
     assert result[0]["confidence"] == pytest.approx(0.75)
     assert type(result[0]["confidence"]) is float
@@ -142,9 +130,7 @@ def test_ocr_returns_empty_list_for_empty_prediction() -> None:
 def test_ocr_returns_empty_list_for_page_without_text() -> None:
     page = make_ocr_page(texts=(), scores=(), boxes=())
 
-    result = OCRRecognizer(FakeOCREngine([page])).recognize(
-        Image.new("RGB", (1, 1))
-    )
+    result = OCRRecognizer(FakeOCREngine([page])).recognize(Image.new("RGB", (1, 1)))
 
     assert result == []
 
@@ -153,9 +139,7 @@ def test_ocr_returns_empty_list_when_both_position_fields_are_empty() -> None:
     page = make_ocr_page(texts=(), scores=(), boxes=())
     page["rec_polys"] = ()
 
-    result = OCRRecognizer(FakeOCREngine([page])).recognize(
-        Image.new("RGB", (1, 1))
-    )
+    result = OCRRecognizer(FakeOCREngine([page])).recognize(Image.new("RGB", (1, 1)))
 
     assert result == []
 
@@ -175,9 +159,7 @@ def test_ocr_returns_empty_list_for_flat_empty_numpy_boxes() -> None:
         boxes=np.empty((0,), dtype=np.int64),
     )
 
-    result = OCRRecognizer(FakeOCREngine([page])).recognize(
-        Image.new("RGB", (1, 1))
-    )
+    result = OCRRecognizer(FakeOCREngine([page])).recognize(Image.new("RGB", (1, 1)))
 
     assert result == []
 
@@ -189,9 +171,7 @@ def test_ocr_returns_empty_list_for_two_dimensional_empty_numpy_boxes() -> None:
         boxes=np.empty((0, 4), dtype=np.int64),
     )
 
-    result = OCRRecognizer(FakeOCREngine([page])).recognize(
-        Image.new("RGB", (1, 1))
-    )
+    result = OCRRecognizer(FakeOCREngine([page])).recognize(Image.new("RGB", (1, 1)))
 
     assert result == []
 
@@ -200,9 +180,7 @@ def test_ocr_returns_empty_list_for_flat_empty_numpy_polygons() -> None:
     page = make_ocr_page(texts=(), scores=(), boxes=None)
     page["rec_polys"] = np.empty((0,), dtype=np.int64)
 
-    result = OCRRecognizer(FakeOCREngine([page])).recognize(
-        Image.new("RGB", (1, 1))
-    )
+    result = OCRRecognizer(FakeOCREngine([page])).recognize(Image.new("RGB", (1, 1)))
 
     assert result == []
 
@@ -232,9 +210,7 @@ def test_ocr_rejects_empty_text_with_scalar_numpy_boxes() -> None:
 def test_ocr_returns_empty_list_without_position_fields() -> None:
     page = {"rec_texts": (), "rec_scores": ()}
 
-    result = OCRRecognizer(FakeOCREngine([page])).recognize(
-        Image.new("RGB", (1, 1))
-    )
+    result = OCRRecognizer(FakeOCREngine([page])).recognize(Image.new("RGB", (1, 1)))
 
     assert result == []
 
@@ -254,9 +230,9 @@ def test_ocr_flattens_multiple_pages() -> None:
     first_page = make_ocr_page(texts=("一",), boxes=((1, 1, 2, 2),))
     second_page = make_ocr_page(texts=("二",), boxes=((3, 3, 4, 4),))
 
-    result = OCRRecognizer(
-        FakeOCREngine([first_page, second_page])
-    ).recognize(Image.new("RGB", (1, 1)))
+    result = OCRRecognizer(FakeOCREngine([first_page, second_page])).recognize(
+        Image.new("RGB", (1, 1))
+    )
 
     assert [item["text"] for item in result] == ["一", "二"]
 
@@ -280,7 +256,7 @@ def test_ocr_rejects_text_without_position() -> None:
 
 def test_ocr_rejects_non_mapping_page() -> None:
     engine = FakeOCREngine()
-    engine.pages = [object()]  # type: ignore[list-item] - 验证运行时结构校验
+    engine.pages = [object()]  # type: ignore[list-item]  # 验证运行时结构校验
 
     with pytest.raises(OCRRecognitionError, match="^OCR 结果项必须是映射$"):
         OCRRecognizer(engine).recognize(Image.new("RGB", (1, 1)))

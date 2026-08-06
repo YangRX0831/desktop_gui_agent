@@ -7,11 +7,8 @@ from collections import defaultdict
 
 import pytest
 
+from tests.keyboard_test_support import FakeEnvironment, _controller, fake_environment
 from utils.exceptions import KeyboardOperationError
-
-from tests.keyboard_test_support import FakeEnvironment
-from tests.keyboard_test_support import _controller
-from tests.keyboard_test_support import fake_environment
 
 
 class FakeKey:

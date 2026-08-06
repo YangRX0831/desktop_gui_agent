@@ -6,13 +6,10 @@
 from typing import Any
 
 import pytest
-from PIL import Image
-from PIL import ImageDraw
-from PIL import ImageFont
+from PIL import Image, ImageDraw, ImageFont
 
 from perception import ui_locator
-from perception.ui_locator import UIElement
-from perception.ui_locator import annotate_ui_elements
+from perception.ui_locator import UIElement, annotate_ui_elements
 
 BACKGROUND = (240, 240, 240)
 
@@ -64,7 +61,7 @@ def make_element(
         "text": text,
         "bbox": bbox,
         "element_type": element_type,
-    }  # type: ignore[return-value] - 测试需要构造无效类型值
+    }  # type: ignore[return-value]  # 测试需要构造无效类型值
 
 
 def capture_text(
@@ -336,7 +333,7 @@ def test_multiple_elements_load_font_once(
     def load_font(_path: str, _size: int) -> ImageFont.FreeTypeFont:
         nonlocal calls
         calls += 1
-        return memory_font  # type: ignore[return-value] - 测试字体满足绘制接口
+        return memory_font  # type: ignore[return-value]  # 测试字体满足绘制接口
 
     monkeypatch.setattr(ui_locator.ImageFont, "truetype", load_font)
     elements = [
@@ -376,7 +373,7 @@ def test_font_loader_tries_next_candidate_after_failure(
         calls.append(path)
         if len(calls) == 1:
             raise OSError("missing")
-        return memory_font  # type: ignore[return-value] - 测试字体满足绘制接口
+        return memory_font  # type: ignore[return-value]  # 测试字体满足绘制接口
 
     monkeypatch.setattr(ui_locator.ImageFont, "truetype", load_second)
 
@@ -394,7 +391,7 @@ def test_font_loader_stops_after_success(
 
     def load_first(path: str, _size: int) -> ImageFont.FreeTypeFont:
         calls.append(path)
-        return memory_font  # type: ignore[return-value] - 测试字体满足绘制接口
+        return memory_font  # type: ignore[return-value]  # 测试字体满足绘制接口
 
     monkeypatch.setattr(ui_locator.ImageFont, "truetype", load_first)
 

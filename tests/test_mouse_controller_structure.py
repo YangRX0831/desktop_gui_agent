@@ -8,19 +8,19 @@ import logging
 import math
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
-from typing import cast
+from typing import Any, cast
 
 import pytest
 
 from control import mouse_controller
+from tests.mouse_test_support import (
+    FakeBackend,
+    SafeEnvironment,
+    _controller,
+    _module_source,
+    safe_environment,
+)
 from utils.exceptions import MouseOperationError
-
-from tests.mouse_test_support import FakeBackend
-from tests.mouse_test_support import SafeEnvironment
-from tests.mouse_test_support import _controller
-from tests.mouse_test_support import _module_source
-from tests.mouse_test_support import safe_environment
 
 
 def test_module_has_no_top_level_backend_creation() -> None:
@@ -160,9 +160,7 @@ def test_backend_creation_failure_is_converted_and_chained(
 
     monkeypatch.setattr(mouse_controller, "_create_backend", fail)
 
-    with caplog.at_level(logging.ERROR), pytest.raises(
-        MouseOperationError
-    ) as exc_info:
+    with caplog.at_level(logging.ERROR), pytest.raises(MouseOperationError) as exc_info:
         mouse_controller.MouseController()
 
     assert exc_info.value.__cause__ is failure
@@ -184,9 +182,7 @@ def test_real_backend_factory_converts_initialization_failure(
         lambda name: fake_module,
     )
 
-    with caplog.at_level(logging.ERROR), pytest.raises(
-        MouseOperationError
-    ) as exc_info:
+    with caplog.at_level(logging.ERROR), pytest.raises(MouseOperationError) as exc_info:
         mouse_controller._create_backend()
 
     assert exc_info.value.__cause__ is failure

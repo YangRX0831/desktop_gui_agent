@@ -5,6 +5,7 @@
 
 import logging
 from collections.abc import Iterator
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from io import StringIO
 from types import SimpleNamespace
@@ -15,6 +16,7 @@ import pytest
 from mss.exception import ScreenShotError as MssScreenShotError
 from PIL import Image
 
+import perception.screenshot as screenshot_module
 from perception.screenshot import capture_screen
 from utils.exceptions import ScreenCaptureError
 
@@ -69,6 +71,7 @@ class FakeScreenshot:
             0,
         )
     )
+    raw = bytearray(bgra)
 
 
 class FakeMss:
@@ -82,6 +85,8 @@ class FakeMss:
         self.monitors = MONITORS if monitors is None else monitors
         self.grab_error = grab_error
         self.grabbed_area: dict[str, int] | None = None
+        self.grabbed_areas: list[dict[str, int]] = []
+        self.close_calls = 0
         self.entered = False
         self.exited = False
 
@@ -100,9 +105,21 @@ class FakeMss:
 
     def grab(self, area: dict[str, int]) -> FakeScreenshot:
         self.grabbed_area = area
+        self.grabbed_areas.append(area)
         if self.grab_error is not None:
             raise self.grab_error
         return FakeScreenshot()
+
+    def close(self) -> None:
+        self.close_calls += 1
+
+
+@pytest.fixture(autouse=True)
+def reset_persistent_mss() -> Iterator[None]:
+    """隔离各测试使用的进程级 MSS 实例。"""
+    screenshot_module._cleanup_mss_instance()
+    yield
+    screenshot_module._cleanup_mss_instance()
 
 
 def test_capture_screen_prefers_modern_mss_entry() -> None:
@@ -123,8 +140,8 @@ def test_capture_screen_prefers_modern_mss_entry() -> None:
 
     assert calls == ["MSS"]
     assert fake_mss.grabbed_area == MONITORS[0]
-    assert fake_mss.entered is True
-    assert fake_mss.exited is True
+    assert fake_mss.entered is False
+    assert fake_mss.exited is False
 
 
 def test_capture_screen_falls_back_to_legacy_mss_entry() -> None:
@@ -142,8 +159,8 @@ def test_capture_screen_falls_back_to_legacy_mss_entry() -> None:
 
     assert calls == ["mss"]
     assert fake_mss.grabbed_area == MONITORS[0]
-    assert fake_mss.entered is True
-    assert fake_mss.exited is True
+    assert fake_mss.entered is False
+    assert fake_mss.exited is False
 
 
 def test_capture_screen_does_not_fallback_when_modern_constructor_fails(
@@ -275,7 +292,7 @@ def test_capture_screen_converts_bgra_channels_to_rgb() -> None:
 
 def test_capture_screen_rejects_non_integer_screen_id() -> None:
     with pytest.raises(TypeError):
-        capture_screen(screen_id="0")  # type: ignore[arg-type] - 验证运行时类型校验
+        capture_screen(screen_id="0")  # type: ignore[arg-type]  # 验证运行时类型校验
 
 
 def test_capture_screen_rejects_boolean_screen_id() -> None:
@@ -308,7 +325,7 @@ def test_capture_screen_rejects_non_tuple_region() -> None:
     ):
         with pytest.raises(TypeError):
             capture_screen(
-                region=[0, 0, 10, 10]  # type: ignore[arg-type] - 验证运行时类型校验
+                region=[0, 0, 10, 10]  # type: ignore[arg-type]  # 验证运行时类型校验
             )
 
 
@@ -321,7 +338,7 @@ def test_capture_screen_rejects_region_with_wrong_length() -> None:
     ):
         with pytest.raises(ValueError):
             capture_screen(
-                region=(0, 0, 10)  # type: ignore[arg-type] - 验证运行时长度校验
+                region=(0, 0, 10)  # type: ignore[arg-type]  # 验证运行时长度校验
             )
 
 
@@ -334,7 +351,7 @@ def test_capture_screen_rejects_non_integer_region_value() -> None:
     ):
         with pytest.raises(TypeError):
             capture_screen(
-                region=(0, 0, 10, "10")  # type: ignore[arg-type] - 验证运行时类型校验
+                region=(0, 0, 10, "10")  # type: ignore[arg-type]  # 验证运行时类型校验
             )
 
 
@@ -490,3 +507,74 @@ def test_capture_failure_final_log_excludes_sensitive_exception_data() -> None:
     assert "ScreenShotError" in output
     assert output.count("屏幕截图失败") == 1
     assert all(marker not in output for marker in SENSITIVE_LOG_PARTS)
+
+
+def test_capture_screen_reuses_mss_for_full_and_region_calls() -> None:
+    fake_mss = FakeMss()
+
+    with patch(
+        "perception.screenshot._create_mss_instance",
+        return_value=fake_mss,
+    ) as factory:
+        full = capture_screen()
+        region = capture_screen(screen_id=1, region=(10, 20, 30, 40))
+
+    assert factory.call_count == 1
+    assert full.size == (2, 1)
+    assert region.size == (2, 1)
+    assert fake_mss.grabbed_areas == [
+        MONITORS[0],
+        {"left": 10, "top": 20, "width": 30, "height": 40},
+    ]
+    assert fake_mss.close_calls == 0
+
+
+def test_cleanup_mss_instance_is_idempotent() -> None:
+    fake_mss = FakeMss()
+
+    with patch(
+        "perception.screenshot._create_mss_instance",
+        return_value=fake_mss,
+    ):
+        capture_screen()
+
+    screenshot_module._cleanup_mss_instance()
+    screenshot_module._cleanup_mss_instance()
+
+    assert fake_mss.close_calls == 1
+
+
+def test_capture_screen_recreates_mss_after_grab_failure() -> None:
+    original_error = MssScreenShotError("capture failed")
+    failed_mss = FakeMss(grab_error=original_error)
+    recovered_mss = FakeMss()
+
+    with patch(
+        "perception.screenshot._create_mss_instance",
+        side_effect=[failed_mss, recovered_mss],
+    ) as factory:
+        with pytest.raises(ScreenCaptureError) as error_info:
+            capture_screen()
+        recovered = capture_screen()
+
+    assert error_info.value.__cause__ is original_error
+    assert factory.call_count == 2
+    assert failed_mss.close_calls == 1
+    assert recovered.mode == "RGB"
+    assert recovered_mss.grabbed_area == MONITORS[0]
+
+
+def test_capture_screen_serializes_shared_mss_across_threads() -> None:
+    fake_mss = FakeMss()
+
+    with patch(
+        "perception.screenshot._create_mss_instance",
+        return_value=fake_mss,
+    ) as factory:
+        with ThreadPoolExecutor(max_workers=4) as executor:
+            results = list(executor.map(lambda _: capture_screen(), range(8)))
+
+    assert factory.call_count == 1
+    assert len(fake_mss.grabbed_areas) == 8
+    assert all(result.mode == "RGB" for result in results)
+    assert all(result.size == (2, 1) for result in results)

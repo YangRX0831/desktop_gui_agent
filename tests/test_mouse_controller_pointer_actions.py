@@ -6,18 +6,14 @@
 import logging
 from collections import defaultdict
 from types import SimpleNamespace
-from typing import Any
-from typing import cast
+from typing import Any, cast
 
 import numpy as np
 import pytest
 
 from control import mouse_controller
+from tests.mouse_test_support import SafeEnvironment, _controller, safe_environment
 from utils.exceptions import MouseOperationError
-
-from tests.mouse_test_support import SafeEnvironment
-from tests.mouse_test_support import _controller
-from tests.mouse_test_support import safe_environment
 
 
 class FakeBackend:

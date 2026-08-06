@@ -6,12 +6,10 @@
 from collections.abc import Iterator
 
 import pytest
-from PIL import Image
-from PIL import ImageFont
+from PIL import Image, ImageFont
 
 from perception import ui_locator
-from perception.ui_locator import UIElement
-from perception.ui_locator import annotate_ui_elements
+from perception.ui_locator import UIElement, annotate_ui_elements
 
 BACKGROUND = (240, 240, 240)
 
@@ -55,7 +53,7 @@ def make_element(
         "text": text,
         "bbox": bbox,
         "element_type": element_type,
-    }  # type: ignore[return-value] - 测试需要构造无效类型值
+    }  # type: ignore[return-value]  # 测试需要构造无效类型值
 
 
 def test_empty_elements_returns_same_image() -> None:
@@ -79,7 +77,7 @@ def test_empty_elements_does_not_convert_non_rgb_image() -> None:
 def test_invalid_image_type_raises_type_error(image: object) -> None:
     with pytest.raises(TypeError):
         annotate_ui_elements(
-            image,  # type: ignore[arg-type] - 验证运行时类型校验
+            image,  # type: ignore[arg-type]  # 验证运行时类型校验
             [],
         )
 
@@ -97,7 +95,7 @@ def test_string_like_elements_raise_type_error(elements: object) -> None:
     with pytest.raises(TypeError):
         annotate_ui_elements(
             make_image(),
-            elements,  # type: ignore[arg-type] - 验证运行时类型校验
+            elements,  # type: ignore[arg-type]  # 验证运行时类型校验
         )
 
 
@@ -107,7 +105,7 @@ def test_generator_elements_raise_type_error() -> None:
     with pytest.raises(TypeError):
         annotate_ui_elements(
             make_image(),
-            elements,  # type: ignore[arg-type] - 验证运行时类型校验
+            elements,  # type: ignore[arg-type]  # 验证运行时类型校验
         )
 
 
@@ -115,7 +113,7 @@ def test_non_dict_element_raises_type_error() -> None:
     with pytest.raises(TypeError):
         annotate_ui_elements(
             make_image(),
-            [object()],  # type: ignore[list-item] - 验证运行时类型校验
+            [object()],  # type: ignore[list-item]  # 验证运行时类型校验
         )
 
 
@@ -125,7 +123,7 @@ def test_missing_element_field_raises_value_error() -> None:
     with pytest.raises(ValueError):
         annotate_ui_elements(
             make_image(),
-            [element],  # type: ignore[list-item] - 验证运行时字段校验
+            [element],  # type: ignore[list-item]  # 验证运行时字段校验
         )
 
 
@@ -135,7 +133,7 @@ def test_unknown_element_field_raises_value_error() -> None:
     with pytest.raises(ValueError):
         annotate_ui_elements(
             make_image(),
-            [element],  # type: ignore[list-item] - 验证运行时字段校验
+            [element],  # type: ignore[list-item]  # 验证运行时字段校验
         )
 
 
@@ -145,7 +143,7 @@ def test_non_string_text_raises_type_error() -> None:
     with pytest.raises(TypeError):
         annotate_ui_elements(
             make_image(),
-            [element],  # type: ignore[list-item] - 验证运行时字段校验
+            [element],  # type: ignore[list-item]  # 验证运行时字段校验
         )
 
 
@@ -155,7 +153,7 @@ def test_non_string_element_type_raises_type_error() -> None:
     with pytest.raises(TypeError):
         annotate_ui_elements(
             make_image(),
-            [element],  # type: ignore[list-item] - 验证运行时字段校验
+            [element],  # type: ignore[list-item]  # 验证运行时字段校验
         )
 
 
@@ -173,7 +171,7 @@ def test_non_tuple_bbox_raises_type_error() -> None:
     with pytest.raises(TypeError):
         annotate_ui_elements(
             make_image(),
-            [element],  # type: ignore[list-item] - 验证运行时字段校验
+            [element],  # type: ignore[list-item]  # 验证运行时字段校验
         )
 
 
@@ -183,7 +181,7 @@ def test_bbox_wrong_length_raises_value_error() -> None:
     with pytest.raises(ValueError):
         annotate_ui_elements(
             make_image(),
-            [element],  # type: ignore[list-item] - 验证运行时字段校验
+            [element],  # type: ignore[list-item]  # 验证运行时字段校验
         )
 
 
@@ -196,7 +194,7 @@ def test_invalid_bbox_coordinate_type_raises_type_error(
     with pytest.raises(TypeError):
         annotate_ui_elements(
             make_image(),
-            [element],  # type: ignore[list-item] - 验证运行时字段校验
+            [element],  # type: ignore[list-item]  # 验证运行时字段校验
         )
 
 

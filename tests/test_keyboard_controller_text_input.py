@@ -9,13 +9,14 @@ from collections import defaultdict
 import pytest
 
 from control import keyboard_controller
+from tests.keyboard_test_support import (
+    FakeEnvironment,
+    FakeKey,
+    FakeTextBackend,
+    _controller,
+    fake_environment,
+)
 from utils.exceptions import KeyboardOperationError
-
-from tests.keyboard_test_support import FakeEnvironment
-from tests.keyboard_test_support import FakeKey
-from tests.keyboard_test_support import FakeTextBackend
-from tests.keyboard_test_support import _controller
-from tests.keyboard_test_support import fake_environment
 
 
 class FakeKeyboardBackend:
@@ -85,11 +86,7 @@ def test_type_passes_characters_in_order(
 
     result = controller.type(text)
 
-    expected = [
-        event
-        for key in keys
-        for event in (("press", key), ("release", key))
-    ]
+    expected = [event for key in keys for event in (("press", key), ("release", key))]
     assert result is None
     assert fake_environment.keyboard.events == expected
     assert fake_environment.sleeps == [0.05] * max(len(text) - 1, 0) + [0.1]
@@ -225,9 +222,10 @@ def test_sensitive_type_data_is_not_logged_or_exposed(
     fake_environment.keyboard.fail_on("press", 1, original)
     controller = _controller(fake_environment)
 
-    with caplog.at_level(logging.ERROR), pytest.raises(
-        KeyboardOperationError
-    ) as caught:
+    with (
+        caplog.at_level(logging.ERROR),
+        pytest.raises(KeyboardOperationError) as caught,
+    ):
         controller.type(sensitive)
 
     combined = " ".join(record.message for record in caplog.records)

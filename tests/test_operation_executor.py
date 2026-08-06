@@ -9,15 +9,13 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from io import StringIO
 from pathlib import Path
-from typing import Any
-from typing import cast
+from typing import Any, cast
 
 import pytest
 
 from control import operation_executor
 from control.operation_executor import execute_operation
-from utils.exceptions import KeyboardOperationError
-from utils.exceptions import MouseOperationError
+from utils.exceptions import KeyboardOperationError, MouseOperationError
 
 FIXED_EVENT = "operation_execution_failed"
 
@@ -61,7 +59,8 @@ class SensitiveCallable:
     ids=["none", "false", "true", "zero", "empty_string", "object"],
 )
 def test_normal_return_value_is_always_success(return_value: object) -> None:
-    operation = lambda: return_value
+    def operation() -> object:
+        return return_value
 
     result = execute_operation(operation)
 
@@ -236,7 +235,8 @@ def test_final_log_excludes_keyword_arguments() -> None:
 
 
 def test_successful_return_value_is_not_logged() -> None:
-    operation = lambda: "SENSITIVE_RETURN_VALUE"
+    def operation() -> str:
+        return "SENSITIVE_RETURN_VALUE"
 
     with formatted_log_output() as stream:
         result = execute_operation(operation)
