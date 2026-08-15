@@ -1,4 +1,21 @@
-"""提供通义千问开放平台多模态 API 后端。"""
+"""提供 OpenAI-compatible 多模态 API 后端。
+
+职责：
+    将一张 Pillow 截图和一个 prompt 编码为固定的多模态 HTTP 请求，并从
+    响应中提取唯一文本。后端只做一次同步请求，重试属于 ``ModelClient``。
+
+配置约束：
+    endpoint、模型名和 API key 在实例构造时保存，但在真正 generate 前
+    才验证完整性。模块导入和 ``from_env`` 不发起网络请求。
+
+网络约束：
+    重定向被禁止，响应体大小有上限，并区分可重试 transport/服务端失败与
+    不可重试配置、认证和协议失败，防止无界请求或错误目标漂移。
+
+隐私边界：
+    截图会发送给用户显式配置的 API 服务，因此调用权限由运行任务
+    管理。本模块不把 key、prompt、图片、响应正文或异常正文写入日志。
+"""
 
 import base64
 import importlib
@@ -16,38 +33,60 @@ _MODEL_ENV = "DASHSCOPE_API_MODEL"
 _ENDPOINT_ENV = "DASHSCOPE_API_ENDPOINT"
 _TIMEOUT_ENV = "DASHSCOPE_TIMEOUT_SECONDS"
 _DEFAULT_ENDPOINT = "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions"
-_CHAT_COMPLETIONS_PATH = "/compatible-mode/v1/chat/completions"
-# 只允许官方域名与固定路径，避免 API Key 和图像被发送到任意 endpoint；
-# 请求层同时禁用重定向作为第二层防护。
-_ALLOWED_ENDPOINT_HOSTNAMES = frozenset(
-    {
-        "dashscope.aliyuncs.com",
-        "token-plan.cn-beijing.maas.aliyuncs.com",
-    },
-)
+_CHAT_COMPLETIONS_SUFFIX = "/chat/completions"
 _DEFAULT_TIMEOUT_SECONDS = 30.0
 _MAX_TIMEOUT_SECONDS = 120.0
 _RETRYABLE_HTTP_STATUS = frozenset({408, 429, 500, 502, 503, 504})
 
 
 class DashScopeAPIError(RuntimeError):
-    """表示通义千问开放平台调用失败。"""
+    """表示通义千问开放平台调用失败。
+
+    Attributes:
+        异常仅携带固定安全描述，不应包含响应正文或凭据。
+
+    ``ModelClient`` 通过具体子类判断是否允许有限重试。
+    """
 
 
 class DashScopeAPIConfigurationError(DashScopeAPIError):
-    """表示通义千问开放平台外部配置缺失或不安全。"""
+    """表示开放平台外部配置缺失或不安全。
+
+    Attributes:
+        配置值本身不会存入异常正文。
+
+    该错误不可重试；调用方返回固定配置提示且不发送请求。
+    """
 
 
 class DashScopeAPIRetryableError(DashScopeAPIError):
-    """表示可进行有限重试的临时 API 故障。"""
+    """表示可进行有限重试的临时 API 故障。
+
+    Attributes:
+        类别来自 transport 异常或明确服务端状态，不含响应正文。
+
+    ``ModelClient`` 捕获后按 max_api_retries 再次调用后端。
+    """
 
 
 class DashScopeAPINonRetryableError(DashScopeAPIError):
-    """表示不应重试的 API 请求、鉴权或响应故障。"""
+    """表示不应重试的请求、鉴权或响应故障。
+
+    Attributes:
+        仅保存安全错误类别，不保存 API key、请求或响应数据。
+
+    该错误立即停止，避免无效请求、成本放大或重复上传截图。
+    """
 
 
 class HTTPResponse(Protocol):
-    """定义 API transport 返回值的最小合同。"""
+    """定义 API transport 返回值的最小合同。
+
+    Attributes:
+        status_code: HTTP 状态码。
+
+    典型实现是 requests Response；后端只使用状态码和 ``json``。
+    """
 
     status_code: int
 
@@ -56,7 +95,13 @@ class HTTPResponse(Protocol):
 
 
 class HTTPTransport(Protocol):
-    """定义可注入的同步 HTTP transport。"""
+    """定义可注入的同步 HTTP transport。
+
+    Attributes:
+        transport 自行管理连接状态；后端不读取其私有属性。
+
+    production 使用 requests session 兼容对象，测试使用内存 fake。
+    """
 
     def post(
         self,
@@ -71,7 +116,17 @@ class HTTPTransport(Protocol):
 
 
 class DashScopeAPIBackend:
-    """通过通义千问开放平台兼容接口执行多模态请求。"""
+    """通过通义千问开放平台兼容接口执行多模态请求。
+
+    Attributes:
+        api_key: 只用于 Authorization header，不写入日志。
+        model: 固定多模态模型名。
+        endpoint: 经过 HTTPS 与主机约束的服务 URL。
+        timeout_seconds: 受上限约束的同步请求超时。
+        transport: 可注入的单请求 HTTP 客户端。
+
+    典型用法是 ``from_env`` 构造，再由 ``ModelClient`` 管理有限重试。
+    """
 
     def __init__(
         self,
@@ -174,15 +229,21 @@ class DashScopeAPIBackend:
             raise ValueError("prompt 不得为空。")
 
     def _validate_configuration(self) -> None:
-        """验证凭据、模型和仅限官方域名的 HTTPS endpoint。"""
+        """验证凭据、模型和 OpenAI-compatible HTTPS endpoint。"""
         parsed = urlparse(self._endpoint)
+        try:
+            port = parsed.port
+        except ValueError as exception:
+            raise DashScopeAPIConfigurationError(
+                DASHSCOPE_CONFIGURATION_MESSAGE,
+            ) from exception
         if (
             not self._api_key
             or not self._model
             or parsed.scheme != "https"
-            or parsed.hostname not in _ALLOWED_ENDPOINT_HOSTNAMES
-            or parsed.netloc != parsed.hostname
-            or parsed.path != _CHAT_COMPLETIONS_PATH
+            or not parsed.hostname
+            or port not in {None, 443}
+            or not parsed.path.endswith(_CHAT_COMPLETIONS_SUFFIX)
             or parsed.username is not None
             or parsed.password is not None
             or parsed.query
@@ -209,7 +270,6 @@ class DashScopeAPIBackend:
         """构造单轮图像与文本消息，保持现有完整 prompt 不变。"""
         return {
             "model": self._model,
-            "enable_thinking": False,
             "messages": [
                 {
                     "role": "user",

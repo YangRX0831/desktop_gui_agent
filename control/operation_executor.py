@@ -1,10 +1,23 @@
-"""提供统一的桌面操作异常捕获入口。"""
+"""提供统一的桌面操作异常捕获入口。
+
+职责：
+    调用一个已经由白名单分发器选定的控制操作，并把普通运行异常转换为
+    ``False``。任何正常返回值都表示调用完成，因此统一返回 ``True``。
+
+异常约束：
+    鼠标和键盘控制器已经在各自责任边界记录领域异常，本层不重复记录。
+    其他 Exception 只记录安全位置；BaseException 子类继续传播，避免吞掉
+    KeyboardInterrupt、SystemExit 等进程控制信号。
+
+本层不重试。有限单步重试由 ``GuiAgent`` 统一管理，否则控制器、包装器和
+编排器分别重试会重复产生桌面副作用且无法精确统计。
+"""
 
 import logging
 from collections.abc import Callable
 
 from utils.exceptions import KeyboardOperationError, MouseOperationError
-from utils.safe_logging import log_safe_exception
+from utils.logger import log_safe_exception
 
 logger = logging.getLogger(__name__)
 

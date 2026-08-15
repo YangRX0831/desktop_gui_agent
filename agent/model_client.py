@@ -1,9 +1,32 @@
-"""提供本地与 API 多模态后端之间的统一调用边界。"""
+"""提供本地与 API 多模态后端之间的统一调用边界。
+
+职责:
+    向 Agent 暴露统一 ``generate`` 接口，并把本地后端、DashScope 后端及
+    有限 API transport retry 隔离在同一个责任边界内。
+
+重试约束:
+    API 失败允许首次请求后的最多三次重试。调用方不得围绕本客户端再做
+    模型调用重试，否则实际网络请求会产生乘法放大。不可重试异常立即停止。
+
+本地模型约束:
+    production 采用 PRD 3.3/4.3.1 规定的 Transformers + Qwen2-VL-2B-Instruct
+    + 4-bit 量化加载；模型权重位于仓库外，构造阶段只验证路径，权在首次
+    generate 延迟加载。历史 OpenVINO 实现已不再作为 production baseline。
+
+fallback 授权约束（AGENTS §11.2）:
+    PRD 4.3.1 的 ``模型加载失败时自动切换到 API 模式`` 仅作为 local 模式下
+    model-load-failure -> API fallback capability 保留。真正发送 screenshot/
+    prompt 到远程 API 前，必须同时满足 ``fallback_enabled`` 和当前 run 的
+    ``fallback_authorized``；触发范围仅限 ``LocalModelLoadError``，不得把任意
+    本地推理异常扩大为 fallback trigger。
+
+隐私与异常:
+    图像和 prompt 仅传给显式选择的后端。日志只包含固定事件、异常类型和
+    安全代码位置，不记录原始输入、响应、异常正文或模型目录内容。
+"""
 
 import importlib
-import json
 import logging
-import math
 from pathlib import Path
 from typing import Literal, Protocol
 
@@ -15,7 +38,7 @@ from agent.dashscope_api_backend import (
     DashScopeAPIConfigurationError,
     DashScopeAPIRetryableError,
 )
-from utils.safe_logging import log_safe_exception
+from utils.logger import log_safe_exception
 
 logger = logging.getLogger(__name__)
 
@@ -23,67 +46,76 @@ _LOCAL_FAILURE_MESSAGE = "本地模型调用失败。"
 _API_FAILURE_MESSAGE = "API 模型调用失败。"
 _LOCAL_FAILURE_EVENT = "local_model_call_failed"
 _API_FAILURE_EVENT = "api_model_call_failed"
-_QWEN_REPOSITORY = "Qwen/Qwen2-VL-2B-Instruct"
-_CONVERSION_MANIFEST = "conversion-manifest.json"
-_OPENVINO_CONFIG = "openvino_config.json"
-_MODEL_CONFIG = "config.json"
+_MODEL_ID = "Qwen/Qwen2-VL-2B-Instruct"
 _LOCAL_LOAD_MESSAGE = "本地 Qwen2-VL 模型加载失败。"
 _LOCAL_INFERENCE_MESSAGE = "本地 Qwen2-VL 模型推理失败。"
 _LOCAL_OUTPUT_MESSAGE = "本地 Qwen2-VL 模型输出无效。"
+_LOCAL_ARGS_MESSAGE = "本地 Qwen2-VL 模型参数无效。"
 _MAX_NEW_TOKENS = 256
-_MAX_VISUAL_TOKENS = 1280
-_VISION_PATCH_SIZE = 28
-_IMAGE_PREFIX = "<|vision_start|><|image_pad|><|vision_end|>\n"
-
-
-class ModelClientError(RuntimeError):
-    """供具体模型后端在其责任边界表示运行失败。"""
 
 
 class LocalModelLoadError(RuntimeError):
-    """表示本地模型依赖、清单或 pipeline 加载失败。"""
+    """表示本地模型权重、processor 或 pipeline 加载失败。
+
+    PRD 4.3.1 的 model-load-failure -> API fallback capability 仅以此类异常
+    作为触发条件；本地推理失败不得归入此类。ModelClient 据此区分是否允许
+    进入批准的 API fallback。
+    """
 
 
 class LocalModelInferenceError(RuntimeError):
-    """表示本地模型图像处理或推理失败。"""
+    """表示本地模型图像处理或推理失败。
+
+    该错误不属于 model-load 失败，因此不得触发 local->API fallback；
+    本地后端不自行重试，避免隐藏推理成本和重复工作。
+    """
 
 
 class LocalModelOutputError(RuntimeError):
-    """表示本地模型没有返回可用的非空文本。"""
+    """表示本地模型没有返回可用的非空文本。
+
+    该错误不能通过宽松 Parser 或字符串 salvage 恢复，也不触发 fallback。
+    """
 
 
 class ModelBackend(Protocol):
-    """定义模型后端必须提供的最小同步接口。"""
+    """定义模型后端必须提供的最小同步接口。
+
+    production 实现为本地 Qwen 或 DashScope；fake 用于无外部副作用测试。
+    """
 
     def generate(self, image: Image.Image, prompt: str) -> str:
         """根据图像和提示词生成文本。"""
 
 
 class Qwen2VLLocalBackend:
-    """通过延迟加载的 OpenVINO GenAI CPU pipeline 调用 Qwen2-VL。"""
+    """通过 Transformers + 4-bit 量化加载 Qwen2-VL-2B-Instruct。
+
+    Attributes:
+        model_dir: 已验证的仓库外 Qwen2-VL-2B-Instruct 模型目录。
+        max_new_tokens: 单次生成的输出 token 上限。
+        model: 延迟加载的 Transformers 多模态生成模型。
+        processor: 延迟加载的 Transformers 多模态 processor。
+
+    production 通常构造一次再串行调用。模型保持延迟加载，构造阶段不读取
+    权重，也不触发 ``from_pretrained``。
+    """
 
     def __init__(
         self,
         model_dir: str | Path,
         *,
         max_new_tokens: int = 64,
-        min_visual_tokens: int = 256,
-        max_visual_tokens: int = 512,
     ) -> None:
         """保存并验证本地模型调用配置，不加载模型。
 
         Args:
-            model_dir: 本地 OpenVINO 模型目录。
+            model_dir: 本地 Qwen2-VL-2B-Instruct 模型目录。
             max_new_tokens: 单次生成的最大新 token 数。
-            min_visual_tokens: 图像缩放后的最小视觉 token 数量。
-            max_visual_tokens: 图像缩放后的最大视觉 token 数量。
 
         Raises:
             TypeError: 配置参数类型不合法。
-            ValueError: 配置值越界、视觉 token 范围不合法，或模型目录
-                不存在或不是目录。
-
-        构造阶段只验证配置与路径，不加载模型 pipeline；模型保持延迟加载。
+            ValueError: 配置值越界，或模型目录不存在/不是目录。
         """
         if not isinstance(model_dir, (str, Path)):
             raise TypeError("model_dir 必须是 str 或 Path。")
@@ -94,165 +126,86 @@ class Qwen2VLLocalBackend:
             raise ValueError("model_dir 不存在。")
         if not path.is_dir():
             raise ValueError("model_dir 必须是目录。")
-        self._validate_integer(
-            max_new_tokens,
-            "max_new_tokens",
-            _MAX_NEW_TOKENS,
-        )
-        self._validate_integer(
-            min_visual_tokens,
-            "min_visual_tokens",
-            _MAX_VISUAL_TOKENS,
-        )
-        self._validate_integer(
-            max_visual_tokens,
-            "max_visual_tokens",
-            _MAX_VISUAL_TOKENS,
-        )
-        if min_visual_tokens > max_visual_tokens:
-            raise ValueError("min_visual_tokens 不得大于 max_visual_tokens。")
+        if type(max_new_tokens) is not int:
+            raise TypeError("max_new_tokens 必须是 int。")
+        if not 1 <= max_new_tokens <= _MAX_NEW_TOKENS:
+            raise ValueError(f"max_new_tokens 必须在 1 到 {_MAX_NEW_TOKENS} 之间。")
 
         self._model_dir = path
         self._max_new_tokens = max_new_tokens
-        self._min_visual_tokens = min_visual_tokens
-        self._max_visual_tokens = max_visual_tokens
-        self._pipeline: object | None = None
-        self._openvino_module: object | None = None
-        self._numpy_module: object | None = None
-        self._genai_module: object | None = None
+        self._model: object | None = None
+        self._processor: object | None = None
+        self._transformers_module: object | None = None
 
     @staticmethod
-    def _validate_integer(value: object, name: str, maximum: int) -> None:
-        """严格验证正整数配置及其保守上限。"""
-        if type(value) is not int:
-            raise TypeError(f"{name} 必须是 int。")
-        if not 1 <= value <= maximum:
-            raise ValueError(f"{name} 必须在 1 到 {maximum} 之间。")
+    def _read_config(path: Path) -> object:
+        """读取 UTF-8 JSON 模型配置；失败由加载边界统一包装。"""
+        import json
 
-    @staticmethod
-    def _read_json(path: Path) -> object:
-        """读取 UTF-8 JSON；具体失败由模型加载边界统一包装。"""
         return json.loads(path.read_text(encoding="utf-8-sig"))
 
-    def _validate_model_files(self) -> None:
-        """核对部署清单、revision、模型类型和 INT4 元数据。"""
-        manifest = self._read_json(self._model_dir / _CONVERSION_MANIFEST)
-        openvino_config = self._read_json(self._model_dir / _OPENVINO_CONFIG)
-        model_config = self._read_json(self._model_dir / _MODEL_CONFIG)
-        if not isinstance(manifest, dict):
-            raise ValueError("invalid conversion manifest")
-        if not isinstance(openvino_config, dict):
-            raise ValueError("invalid OpenVINO config")
-        if not isinstance(model_config, dict):
-            raise ValueError("invalid model config")
-
-        revision = manifest.get("revision")
-        quantization = manifest.get("quantization")
-        if (
-            manifest.get("repository") != _QWEN_REPOSITORY
-            or not isinstance(revision, str)
-            or len(revision) != 40
-            or any(character not in "0123456789abcdef" for character in revision)
-            or not self._model_dir.name.startswith(f"{revision}-")
-            or manifest.get("directory_name") != self._model_dir.name
-            or manifest.get("format") != "openvino_int4"
-            or manifest.get("device") != "CPU"
-            or manifest.get("trust_remote_code") is not False
-            or not isinstance(quantization, dict)
-            or quantization.get("weight_format") != "int4"
-            or quantization.get("bits") != 4
-        ):
-            raise ValueError("conversion manifest mismatch")
-
-        ov_quantization = openvino_config.get("quantization_config")
-        if (
-            openvino_config.get("dtype") != "int4"
-            or not isinstance(ov_quantization, dict)
-            or ov_quantization.get("dtype") != "int4"
-            or ov_quantization.get("bits") != 4
-            or ov_quantization.get("trust_remote_code") is not False
-            or model_config.get("model_type") != "qwen2_vl"
-        ):
-            raise ValueError("model metadata mismatch")
-
-    def _load_pipeline(self) -> object:
-        """验证本地文件并创建固定 CPU pipeline。"""
-        if self._pipeline is not None:
-            return self._pipeline
+    def _validate_model_dir(self) -> None:
+        """核对模型目录含 Qwen2-VL 必要文件，不加载权重。"""
+        config_path = self._model_dir / "config.json"
+        if not config_path.is_file():
+            raise ValueError("model_dir 缺少 config.json。")
         try:
-            self._validate_model_files()
-            openvino_module = importlib.import_module("openvino")
-            numpy_module = importlib.import_module("numpy")
-            genai_module = importlib.import_module("openvino_genai")
-            pipeline_factory = getattr(genai_module, "VLMPipeline")
-            pipeline = pipeline_factory(self._model_dir, "CPU")
+            config = self._read_config(config_path)
         except Exception as exception:
-            self._pipeline = None
-            self._openvino_module = None
-            self._numpy_module = None
-            self._genai_module = None
+            raise ValueError("model_dir config.json 无效。") from exception
+        if not isinstance(config, dict):
+            raise ValueError("model_dir config.json 结构无效。")
+        # 仅校验 model_type，不绑定特定 Transformers 版本字段集，保持最小必要。
+        if config.get("model_type") != "qwen2_vl":
+            raise ValueError("model_dir 不是 qwen2_vl 模型。")
+        if not (self._model_dir / "preprocessor_config.json").is_file():
+            raise ValueError("model_dir 缺少 preprocessor_config.json。")
+        if not (self._model_dir / "tokenizer.json").is_file():
+            raise ValueError("model_dir 缺少 tokenizer.json。")
+
+    def _load_pipeline(self) -> tuple[object, object, object]:
+        """延迟加载 Transformers 模型、processor 与模块句柄。
+
+        Raises:
+            LocalModelLoadError: 模型或 processor 加载失败。该异常类型被
+                ModelClient 识别为 PRD model-load-failure，是触发 fallback 的
+                唯一条件。
+        """
+        if self._model is not None and self._processor is not None:
+            return self._model, self._processor, self._transformers_module
+        try:
+            self._validate_model_dir()
+            transformers_module = importlib.import_module("transformers")
+            auto_processor = getattr(transformers_module, "AutoProcessor")
+            model_cls = getattr(transformers_module, "Qwen2VLForConditionalGeneration")
+            bnb_config_cls = getattr(transformers_module, "BitsAndBytesConfig")
+            # PRD 4.3.1 4-bit 量化加载合同：BitsAndBytesConfig(load_in_4bit=True)
+            # 通过 bitsandbytes 把权重加载为 4-bit,降低显存占用。
+            # transformers 5.x 不再接受 load_in_4bit 直接参数,必须通过
+            # quantization_config 传递。local_files_only=True 防止缺文件时
+            # 隐式联网下载。config.json model_type=qwen2_vl、无 auto_map,
+            # 不需要 trust_remote_code。
+            quantization_config = bnb_config_cls(load_in_4bit=True)
+            processor = auto_processor.from_pretrained(
+                self._model_dir,
+                local_files_only=True,
+            )
+            model = model_cls.from_pretrained(
+                self._model_dir,
+                quantization_config=quantization_config,
+                local_files_only=True,
+            )
+            model.eval()
+        except Exception as exception:
+            self._model = None
+            self._processor = None
+            self._transformers_module = None
             raise LocalModelLoadError(_LOCAL_LOAD_MESSAGE) from exception
 
-        self._openvino_module = openvino_module
-        self._numpy_module = numpy_module
-        self._genai_module = genai_module
-        self._pipeline = pipeline
-        return pipeline
-
-    def _target_size(self, width: int, height: int) -> tuple[int, int]:
-        """把图像缩放到配置的视觉 Token 范围和 28 像素有效网格。"""
-        # 28 是 Qwen2-VL 视觉输入的有效网格对齐尺度（patch_size=14 ×
-        # spatial_merge_size=2）；按该网格缩放图像，在控制视觉 token 数量的
-        # 同时保持模型要求的尺寸对齐。
-        current_tokens = width * height / (_VISION_PATCH_SIZE**2)
-        target_tokens = min(
-            max(current_tokens, self._min_visual_tokens),
-            self._max_visual_tokens,
-        )
-        scale = math.sqrt(target_tokens * (_VISION_PATCH_SIZE**2) / (width * height))
-        target_width = max(
-            _VISION_PATCH_SIZE,
-            round(width * scale / _VISION_PATCH_SIZE) * _VISION_PATCH_SIZE,
-        )
-        target_height = max(
-            _VISION_PATCH_SIZE,
-            round(height * scale / _VISION_PATCH_SIZE) * _VISION_PATCH_SIZE,
-        )
-        while (
-            target_width * target_height / (_VISION_PATCH_SIZE**2)
-            > self._max_visual_tokens
-        ):
-            if target_width >= target_height and target_width > _VISION_PATCH_SIZE:
-                target_width -= _VISION_PATCH_SIZE
-            elif target_height > _VISION_PATCH_SIZE:
-                target_height -= _VISION_PATCH_SIZE
-            else:
-                break
-        return target_width, target_height
-
-    def _prepare_tensor(self, image: Image.Image) -> object:
-        """从 PIL 图像副本创建 OpenVINO NHWC RGB Tensor。"""
-        if self._openvino_module is None or self._numpy_module is None:
-            raise RuntimeError("runtime modules are unavailable")
-        rgb_image = image.convert("RGB").copy()
-        target_size = self._target_size(*rgb_image.size)
-        if rgb_image.size != target_size:
-            rgb_image = rgb_image.resize(target_size, Image.Resampling.BICUBIC)
-        asarray = getattr(self._numpy_module, "asarray")
-        array = asarray(rgb_image).copy()
-        tensor_factory = getattr(self._openvino_module, "Tensor")
-        return tensor_factory(array)
-
-    @staticmethod
-    def _extract_text(result: object) -> str:
-        """从官方结果对象提取首个非空文本。"""
-        texts = getattr(result, "texts")
-        if isinstance(texts, (str, bytes)) or len(texts) == 0:
-            raise ValueError("missing result text")
-        text = texts[0]
-        if not isinstance(text, str) or not text.strip():
-            raise ValueError("invalid result text")
-        return text
+        self._model = model
+        self._processor = processor
+        self._transformers_module = transformers_module
+        return model, processor, transformers_module
 
     @staticmethod
     def _validate_generate_args(image: Image.Image, prompt: str) -> None:
@@ -264,8 +217,71 @@ class Qwen2VLLocalBackend:
         if not prompt.strip():
             raise ValueError("prompt 不得为空。")
 
+    def _build_inputs(
+        self,
+        processor: object,
+        image: Image.Image,
+        prompt: str,
+    ) -> object:
+        """把 PIL 图像与 prompt 转换为模型输入；失败归为推理错误。"""
+        try:
+            messages = [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "image"},
+                        {"type": "text", "text": prompt},
+                    ],
+                },
+            ]
+            chat_template = getattr(processor, "apply_chat_template", None)
+            if chat_template is None:
+                raise ValueError("processor 缺少 apply_chat_template。")
+            text = chat_template(messages, tokenize=False, add_generation_prompt=True)
+            rgb_image = image.convert("RGB")
+            batch = processor(
+                text=[text],
+                images=[rgb_image],
+                padding=True,
+                return_tensors="pt",
+            )
+            return batch
+        except Exception as exception:
+            raise LocalModelInferenceError(_LOCAL_INFERENCE_MESSAGE) from exception
+
+    def _generate_text(self, model: object, batch: object) -> str:
+        """执行一次模型生成并提取首个非空文本。"""
+        try:
+            generate_kwargs = {
+                "max_new_tokens": self._max_new_tokens,
+                "do_sample": False,
+            }
+            output_ids = model.generate(**batch, **generate_kwargs)
+        except Exception as exception:
+            raise LocalModelInferenceError(_LOCAL_INFERENCE_MESSAGE) from exception
+        try:
+            generated = output_ids[:, batch["input_ids"].shape[1] :]
+            # type: ignore[index]  # Transformers 返回 Tensor，但本后端不依赖其类型存根。
+            processor = self._processor
+            if processor is None:
+                raise LocalModelOutputError(_LOCAL_OUTPUT_MESSAGE)
+            decode = getattr(processor, "batch_decode", None)
+            if decode is None:
+                raise LocalModelOutputError(_LOCAL_OUTPUT_MESSAGE)
+            texts = decode(generated, skip_special_tokens=True)
+            if not texts or not isinstance(texts[0], str):
+                raise LocalModelOutputError(_LOCAL_OUTPUT_MESSAGE)
+            text = texts[0].strip()
+            if not text:
+                raise LocalModelOutputError(_LOCAL_OUTPUT_MESSAGE)
+            return text
+        except LocalModelOutputError:
+            raise
+        except Exception as exception:
+            raise LocalModelOutputError(_LOCAL_OUTPUT_MESSAGE) from exception
+
     def generate(self, image: Image.Image, prompt: str) -> str:
-        """使用固定 CPU pipeline 生成非空文本。
+        """使用 Transformers 4-bit 模型生成非空文本。
 
         Args:
             image: 待理解的 PIL 图像。
@@ -277,41 +293,32 @@ class Qwen2VLLocalBackend:
         Raises:
             TypeError: image 或 prompt 类型不合法。
             ValueError: prompt 为空。
-            LocalModelLoadError: 本地模型加载失败。
-            LocalModelInferenceError: 图像处理或推理失败。
-            LocalModelOutputError: 模型未返回可用的非空文本。
+            LocalModelLoadError: 本地模型加载失败（可触发批准的 API fallback）。
+            LocalModelInferenceError: 图像处理或推理失败（不触发 fallback）。
+            LocalModelOutputError: 模型未返回可用的非空文本（不触发 fallback）。
 
         首次调用在需要时延迟加载本地模型 pipeline，后续调用复用。
         """
         self._validate_generate_args(image, prompt)
-        pipeline = self._load_pipeline()
-        try:
-            tensor = self._prepare_tensor(image)
-            if self._genai_module is None:
-                raise RuntimeError("runtime module is unavailable")
-            config_factory = getattr(self._genai_module, "GenerationConfig")
-            config = config_factory(
-                max_new_tokens=self._max_new_tokens,
-                do_sample=False,
-            )
-            generate_method = getattr(pipeline, "generate")
-            result = generate_method(
-                _IMAGE_PREFIX + prompt,
-                image=tensor,
-                generation_config=config,
-            )
-        except Exception as exception:
-            raise LocalModelInferenceError(
-                _LOCAL_INFERENCE_MESSAGE,
-            ) from exception
-        try:
-            return self._extract_text(result)
-        except Exception as exception:
-            raise LocalModelOutputError(_LOCAL_OUTPUT_MESSAGE) from exception
+        model, processor, _ = self._load_pipeline()
+        batch = self._build_inputs(processor, image, prompt)
+        return self._generate_text(model, batch)
 
 
 class ModelClient:
-    """统一执行本地模型调用、API 回退和有限 API 重试。"""
+    """统一执行本地模型调用、API 回退和有限 API 重试。
+
+    Attributes:
+        local_backend: 首选的本地模型实现，仅在 local 模式调用。
+        api_backend: 显式 API 模式或批准 fallback 时使用的实现。
+        fallback_enabled: 是否保留 PRD model-load-failure -> API capability。
+        max_api_retries: 首次 API 失败后的最多重试次数。
+
+    fallback 授权是 run-scoped、non-persistent:每个 run 必须显式调用
+    ``set_run_fallback_authorization(True)`` 才允许 model-load-failure ->
+    API fallback;默认 deny。run 结束由 ``clear_run_fallback_authorization``
+    复位,下一 run 不继承上一 run 的授权。
+    """
 
     def __init__(
         self,
@@ -326,7 +333,7 @@ class ModelClient:
         Args:
             local_backend: 本地模型后端。
             api_backend: 可选注入后端；省略时从环境创建通义千问后端。
-            fallback_enabled: 本地失败时是否允许转向 API。
+            fallback_enabled: 是否保留 PRD model-load-failure -> API capability。
             max_api_retries: 首次 API 调用失败后允许的重试次数。
 
         Raises:
@@ -351,6 +358,8 @@ class ModelClient:
         self._local_backend = local_backend
         self._api_backend = resolved_api_backend
         self._fallback_enabled = fallback_enabled
+        # run-scoped fallback 授权;默认 deny,每 run 显式设置,不跨 run 继承。
+        self._run_fallback_authorized = False
         self._max_api_retries = max_api_retries
 
     @staticmethod
@@ -358,6 +367,24 @@ class ModelClient:
         """验证后端是否提供可调用的 generate。"""
         if not callable(getattr(backend, "generate", None)):
             raise TypeError(f"{name} 必须提供可调用的 generate。")
+
+    def set_run_fallback_authorization(self, authorized: bool) -> None:
+        """设置当前 run 的 API fallback 授权状态。
+
+        Args:
+            authorized: True 表示当前 run 显式授权 model-load-failure ->
+                API fallback;False 回到 deny-by-default。
+
+        每个 run 边界由调用方显式设置;run 结束应调用
+        ``clear_run_fallback_authorization`` 复位,防止下一 run 继承。
+        """
+        if type(authorized) is not bool:
+            raise TypeError("authorized 必须是 bool。")
+        self._run_fallback_authorized = authorized
+
+    def clear_run_fallback_authorization(self) -> None:
+        """run 结束后复位 fallback 授权,防止跨 run 继承。"""
+        self._run_fallback_authorized = False
 
     @staticmethod
     def _validate_generate_args(
@@ -383,6 +410,14 @@ class ModelClient:
         if not isinstance(response, str):
             raise TypeError("模型后端必须返回 str。")
         return response
+
+    def _can_fallback(self, exception: Exception) -> bool:
+        """判断当前异常是否属于 PRD model-load-failure 且已获当前 run 授权。"""
+        if not isinstance(exception, LocalModelLoadError):
+            return False
+        if not self._fallback_enabled:
+            return False
+        return self._run_fallback_authorized
 
     def _generate_from_api(self, image: Image.Image, prompt: str) -> str:
         """执行首次 API 调用和次数有限的失败后重试。"""
@@ -422,6 +457,10 @@ class ModelClient:
         Raises:
             TypeError: 公共参数类型错误。
             ValueError: 参数值不合法。
+
+        local 模式下，仅当本地模型 *load* 失败、fallback capability 保留
+        且当前 run 显式授权时，才把图像与 prompt 发送给远程 API；其余本地
+        失败一律返回固定本地失败信息，不发送任何远程数据。
         """
         self._validate_generate_args(image, prompt, mode)
         if mode == "api":
@@ -432,6 +471,6 @@ class ModelClient:
             return self._require_text(response)
         except Exception as exception:
             log_safe_exception(logger, _LOCAL_FAILURE_EVENT, exception)
-            if not self._fallback_enabled:
-                return _LOCAL_FAILURE_MESSAGE
-        return self._generate_from_api(image, prompt)
+            if self._can_fallback(exception):
+                return self._generate_from_api(image, prompt)
+            return _LOCAL_FAILURE_MESSAGE

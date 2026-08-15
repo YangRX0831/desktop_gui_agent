@@ -1,4 +1,21 @@
-"""提供基于 PP-OCRv4 的桌面图像文字识别适配。"""
+"""提供基于 PP-OCRv4 的桌面图像文字识别适配。
+
+职责：
+    延迟创建 PRD 指定的 PP-OCRv4 中文 CPU 引擎，把 Pillow RGB 图像转换
+    为后端需要的 BGR uint8 数组，并统一输出文字、边界框和置信度。
+
+结构约束：
+    PaddleOCR 不同结果形状只能通过显式字段和长度校验进入公共格式。文本、
+    分数和框必须按索引一一对应；不完整结果作为识别失败，而非静默丢弃。
+
+坐标约束：
+    后端可能返回四坐标矩形或四点多边形。公共结果统一为包含所有点的整数
+    外接矩形，不推断旋转、DPI 或跨模块坐标转换语义。
+
+安全边界：
+    OCR 原文和图像可能包含用户数据，不写入日志。后端异常转换为项目异常
+    并保留根因；默认构造之外的测试可注入 predictor，避免加载真实模型。
+"""
 
 import logging
 import math
@@ -11,13 +28,21 @@ import numpy as np
 from PIL import Image
 
 from utils.exceptions import OCRModelLoadError, OCRRecognitionError
-from utils.safe_logging import log_safe_exception
+from utils.logger import log_safe_exception
 
 logger = logging.getLogger(__name__)
 
 
 class OCRResult(TypedDict):
-    """描述一项规范化后的 OCR 识别结果。"""
+    """描述一项规范化后的 OCR 识别结果。
+
+    Attributes:
+        text: OCR 完整文字，只在内存感知链中传递。
+        bbox: 识别区域的整数外接矩形。
+        confidence: 后端返回的有限浮点置信度。
+
+    ``OCRRecognizer.recognize`` 返回该结构给感知调用方。
+    """
 
     text: str
     bbox: tuple[int, int, int, int]
@@ -25,7 +50,13 @@ class OCRResult(TypedDict):
 
 
 class OCRPredictor(Protocol):
-    """定义 OCR 推理引擎所需的最小接口。"""
+    """定义 OCR 推理引擎所需的最小接口。
+
+    Attributes:
+        predictor 的模型和缓存状态由实现私有管理。
+
+    默认实现是 PaddleOCR，测试实现不加载真实模型。
+    """
 
     def predict(
         self,
@@ -42,6 +73,11 @@ class OCRPredictor(Protocol):
 
 
 def _create_ocr_engine() -> OCRPredictor:
+    """按冻结参数创建 PP-OCRv4 中文 CPU predictor。
+
+    动态导入避免模块 import 即加载模型；任何导入或构造失败都转换为
+    ``OCRModelLoadError`` 并保留原因，不自动下载或切换后端。
+    """
     logger.info("开始初始化 PP-OCRv4 OCR 模型")
     try:
         module = import_module("paddleocr")
@@ -69,6 +105,10 @@ def _create_ocr_engine() -> OCRPredictor:
 
 
 def _raise_structure_error(message: str) -> NoReturn:
+    """以统一项目异常拒绝后端结构漂移。
+
+    ``message`` 只描述固定字段合同，不能包含 OCR 原文或后端响应正文。
+    """
     logger.error("OCR 结果结构无效：%s", message)
     raise OCRRecognitionError(message)
 
@@ -78,6 +118,10 @@ def _read_sequence(
     field_name: str,
     array_dimensions: int,
 ) -> list[object] | tuple[object, ...]:
+    """读取结果序列并检查 NumPy 数组维度。
+
+    字符串和任意 Iterable 不被接受，避免把 OCR 正文拆成字段项。
+    """
     if isinstance(value, np.ndarray):
         if value.ndim != array_dimensions:
             _raise_structure_error(f"{field_name} 数组维度无效")
@@ -88,6 +132,10 @@ def _read_sequence(
 
 
 def _read_coordinate(value: object, field_name: str) -> int:
+    """把 Integral 坐标规范化为 Python int。
+
+    bool 虽属于整数体系但没有像素坐标语义，因此显式拒绝。
+    """
     if isinstance(value, bool) or not isinstance(value, Integral):
         _raise_structure_error(f"{field_name} 坐标必须是整数")
     coordinate = int(value)
@@ -95,6 +143,10 @@ def _read_coordinate(value: object, field_name: str) -> int:
 
 
 def _parse_box(value: object) -> tuple[int, int, int, int]:
+    """解析具有正面积的四坐标矩形。
+
+    这里只验证后端结构，不推断屏幕、裁剪区域或 DPI 坐标空间。
+    """
     coordinates = _read_sequence(value, "rec_boxes", 1)
     if len(coordinates) != 4:
         _raise_structure_error("rec_boxes 的单项必须包含四个坐标")
@@ -108,6 +160,10 @@ def _parse_box(value: object) -> tuple[int, int, int, int]:
 
 
 def _parse_polygon(value: object) -> tuple[int, int, int, int]:
+    """把非空点序列转换为覆盖全部点的外接矩形。
+
+    每个点必须精确包含两个整数；退化多边形作为结构错误处理。
+    """
     points = _read_sequence(value, "rec_polys", 2)
     if not points:
         _raise_structure_error("rec_polys 的单项不能为空")
@@ -130,6 +186,10 @@ def _parse_polygon(value: object) -> tuple[int, int, int, int]:
 
 
 def _parse_confidence(value: object) -> float:
+    """把有限实数置信度规范化为 float。
+
+    不在此改变后端数值或自行建立阈值，保留 PRD 未定义的策略边界。
+    """
     if isinstance(value, bool) or not isinstance(value, Real):
         _raise_structure_error("rec_scores 的单项必须是实数")
     confidence = float(value)
@@ -139,6 +199,10 @@ def _parse_confidence(value: object) -> float:
 
 
 def _validate_empty_positions(value: object, field_name: str) -> None:
+    """确认空文本页面没有残留位置数据。
+
+    这一区分合法空识别结果与并行字段错位，避免静默遗漏后端错误。
+    """
     if isinstance(value, np.ndarray):
         if value.ndim == 0:
             _raise_structure_error(f"{field_name} 数组维度无效")
@@ -152,6 +216,11 @@ def _validate_empty_positions(value: object, field_name: str) -> None:
 
 
 def _parse_page(page: object) -> list[OCRResult]:
+    """把单页后端映射转换为索引严格对齐的公共结果。
+
+    文本、置信度和位置字段长度必须一致；每项验证完成后才组装结果，
+    防止部分结构有效时返回不完整 OCR 数据。
+    """
     if not isinstance(page, Mapping):
         _raise_structure_error("OCR 结果项必须是映射")
     if "rec_texts" not in page:
