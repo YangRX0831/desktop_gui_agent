@@ -1,6 +1,7 @@
 # Python 字节码、缓存和构建产物
 __pycache__/
 *.py[cod]
+*.pyc
 .mypy_cache/
 .pytest_cache/
 .ruff_cache/
@@ -42,6 +43,9 @@ benchmark/reports/*
 !benchmark/reports/PAIRED_20260821_192024/
 benchmark/reports/PAIRED_20260821_192024/*
 !benchmark/reports/PAIRED_20260821_192024/paired_results.jsonl
+!benchmark/reports/PAIRED_20260821_224007/
+benchmark/reports/PAIRED_20260821_224007/*
+!benchmark/reports/PAIRED_20260821_224007/paired_results.jsonl
 benchmark/screenshots/
 benchmark/.tmp/
 benchmark/tmp/
@@ -49,8 +53,13 @@ benchmark/**/*.jsonl
 benchmark/**/*_before.png
 benchmark/**/*_after.png
 !benchmark/reports/PAIRED_20260821_192024/paired_results.jsonl
+!benchmark/reports/PAIRED_20260821_224007/paired_results.jsonl
 reports/quality/*
+!reports/quality/quality_20260821_233957.json
+!reports/quality/quality_20260821_233957.md
 desktop_gui_agent_final_docs*.zip
+run_local.bat
+run_api.bat
 .zcode/
 diagnostics_feature_plan.md
 周报_*.md
