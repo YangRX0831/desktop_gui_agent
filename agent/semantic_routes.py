@@ -1,15 +1,13 @@
-"""SEMANTIC EXECUTION deterministic terminal routes (FINAL FIX 2+3).
+"""提供若干确定性的键盘语义执行路线。
 
-三条窄路线,全部 keyboard-native(GUI-only):
-1. SaveDialogRoute — Save-As 对话框 foreground 时,修正文件名并完成保存。
-2. FileOpenRoute — 已知 exact 文件路径时,经 Explorer 地址栏直接打开。
-3. FileSearchRoute — 已知 folder + 子串时,经 Explorer 搜索并打开首个结果。
+这些路线用于对界面状态和任务参数已经足够明确的操作进行有界编排，包括保存
+对话框、文件打开与搜索、浏览器搜索、计算器输入、应用启动和跨应用粘贴。
 
-集成合同:
-    - 仅在 semantic_execution 开启时激活
-    - 每步只出一条 ParsedAction(现有 grammar 内的 hotkey/type)
-    - 路线步骤耗尽后归还模型决策权
-    - BENCHMARK_EXECUTION_IS_GUI_ONLY = YES(纯键盘,零文件系统操作)
+集成约束：
+    - 仅在 ``semantic_execution`` 启用时由上层选择；
+    - 每一步只产生一个现有动作协议中的 ``ParsedAction``，或一个有界等待；
+    - 路线耗尽后把决策权交回模型；
+    - 路线只通过 GUI 键盘操作推进，不直接读写目标文件内容。
 """
 
 import logging
@@ -22,7 +20,7 @@ from agent.action_parser import ParsedAction
 
 
 class AppLaunchInfo(TypedDict):
-    """纯应用启动 intent 抽取结果。"""
+    """描述从纯应用启动任务中抽取出的应用信息。"""
 
     app_id: str
     canonical_name: str
@@ -32,7 +30,7 @@ class AppLaunchInfo(TypedDict):
 
 
 class BrowserSearchInfo(TypedDict):
-    """当前浏览器搜索 intent 抽取结果。"""
+    """描述当前浏览器搜索任务中抽取出的查询文本。"""
 
     query: str
 
@@ -53,13 +51,13 @@ _CALCULATOR_TITLE_KEYWORDS = ("Calculator", "计算器")
 
 logger = logging.getLogger(__name__)
 
-# Windows Save-As 对话框窗口类(标准 #32770 对话框)。
+# Windows 标准保存类对话框的窗口类。
 _SAVE_DIALOG_CLASS = "#32770"
 _DESKTOP = Path.home() / "Desktop"
 
 
 def _action_hotkey(*keys: str) -> ParsedAction:
-    """构造 grammar 内的 hotkey ParsedAction。"""
+    """构造动作协议允许的 hotkey 动作。"""
     return {
         "action_type": "hotkey",
         "params": {"keys": tuple(keys)},
@@ -67,13 +65,13 @@ def _action_hotkey(*keys: str) -> ParsedAction:
 
 
 def _action_type(text: str) -> ParsedAction:
-    """构造 grammar 内的 type ParsedAction。"""
+    """构造动作协议允许的 type 动作。"""
     return {"action_type": "type", "params": {"text": text}}
 
 
 @dataclass(frozen=True)
 class SemanticRouteStep:
-    """路线中的单步:一个已解析动作或一个等待。"""
+    """表示语义路线中的一个动作或有界等待步骤。"""
 
     action: ParsedAction | None
     wait_seconds: float = 0.0
@@ -82,14 +80,14 @@ class SemanticRouteStep:
 
 @dataclass
 class SemanticRoute:
-    """一条确定性 keyboard-native 路线(有序步骤列表)。"""
+    """保存一条确定性键盘路线及其当前执行位置。"""
 
     name: str
     steps: list[SemanticRouteStep] = field(default_factory=list)
     _index: int = 0
 
     def next_step(self) -> SemanticRouteStep | None:
-        """返回下一步;路线耗尽返回 None。"""
+        """返回下一步；路线耗尽时返回 None。"""
         if self._index >= len(self.steps):
             return None
         step = self.steps[self._index]
@@ -98,27 +96,22 @@ class SemanticRoute:
 
     @property
     def is_exhausted(self) -> bool:
-        """路线步骤是否已全部派发完毕。"""
+        """返回路线步骤是否已全部派发。"""
         return self._index >= len(self.steps)
 
 
-# ========================================================================
-# FIX 2: Save-As 对话框确定性完成
-# ========================================================================
-
-
 def is_save_download_task(task_text: str) -> bool:
-    """窄模式判断任务语义是否属于保存/下载文件。"""
+    """判断任务文本是否明确涉及保存、下载或另存为。"""
     return bool(re.search(r"保存到|保存|下载|另存为", task_text))
 
 
 def build_save_dialog_route(
     expected_filename: str | None = None,
 ) -> SemanticRoute:
-    """构造 Save-As 完成路线(象限 A/B:无目录导航)。
+    """构造不包含目录导航的标准保存对话框路线。
 
-    有明确文件名:Ctrl+A→type filename→Enter(修正文件名后保存)。
-    无明确文件名:直接 Enter(保留 Save-As 对话框当前默认名保存)。
+    有明确文件名时先选中现有文件名并输入目标名称，再提交保存；没有明确文件名
+    时直接保留对话框当前默认名称并提交。
     """
     steps = []
     if expected_filename is not None:
@@ -143,8 +136,7 @@ def build_save_dialog_route(
     return SemanticRoute(name="save_dialog", steps=steps)
 
 
-# P2 folder navigation:已知 shell 文件夹标识 -> 键入文本(绝对路径)。
-# 只做路径文本解析,不执行任何文件系统操作;解析失败返回 None。
+# 已知用户文件夹名称只解析为待输入对话框的路径文本，不直接操作文件系统。
 _KNOWN_FOLDER_ENV_KEYS = {
     "Desktop": "USERPROFILE",
     "Downloads": "USERPROFILE",
@@ -154,13 +146,11 @@ _KNOWN_FOLDER_ENV_KEYS = {
 
 
 def resolve_save_folder_location(folder_spec: str | None) -> str | None:
-    """把 expected_save_folder 解析为要键入对话框的路径文本。
+    """把目标文件夹描述解析为可输入保存对话框的路径文本。
 
-    已知文件夹(Desktop/Downloads/Documents/Pictures)换算为当前用户
-    profile 下的绝对路径;复合标识 ``Desktop\\子目录`` 换算为
-    ``<profile>\\Desktop\\子目录``(子目录名来自用户可见 instruction);
-    形如 ``C:\\...`` 的绝对路径原样返回;无法解析返回 None(调用方按
-    无目录导航处理,不得文件系统回退)。
+    Desktop、Downloads、Documents 与 Pictures 解析为当前用户 profile 下的绝对
+    路径；``Desktop\\子目录`` 等复合形式保留用户给出的子目录；Windows 盘符
+    开头的绝对路径原样返回。无法确定时返回 None，不使用文件系统回退。
     """
     if folder_spec is None:
         return None
@@ -184,18 +174,16 @@ def build_save_dialog_route_v2(
     folder_spec: str | None = None,
     expected_filename: str | None = None,
 ) -> SemanticRoute:
-    """构造含目录导航的 Save 完成路线(象限 C/D)。
+    """构造包含目录导航的标准保存对话框路线。
 
-    目录导航(File name 字段键入目录路径 + Enter 导航,通用对话框
-    原生行为;导航后焦点回到 File name)→ 文件名分支(None 保留
-    默认名,不 Ctrl+A 不发明名字;显式名 Ctrl+A→type)→ Save 提交
-    (Alt+S,common dialog 保存按钮加速键;不假设第二个 Enter 是
-    Save)。无目录时等价于 build_save_dialog_route 的对应象限。
+    路线先在文件名字段中键入目标目录并提交导航，等待对话框稳定后再根据是否
+    存在明确文件名决定是否覆盖文件名，最后使用保存按钮快捷键提交。若没有目录
+    参数，则退化为 ``build_save_dialog_route``。
     """
     if folder_spec is None:
         return build_save_dialog_route(expected_filename)
     steps = [
-        # File name 字段是 Save 对话框默认焦点;直接键入目录路径。
+        # 标准保存对话框打开时文件名字段通常为默认输入焦点。
         SemanticRouteStep(
             action=_action_type(folder_spec),
             description=f"Type target folder path: {folder_spec}",
@@ -232,10 +220,6 @@ def build_save_dialog_route_v2(
     return SemanticRoute(name="save_dialog_folder", steps=steps)
 
 
-# ========================================================================
-# FIX 3: Explorer keyboard-native 文件路线
-# ========================================================================
-
 _FOLDER_FILE_PATTERN = re.compile(
     r'(?:打开|在).{0,4}桌面[”""](.+?)[”""].{0,6}文件夹'
     r'.{0,20}(?:中的|找到).{0,6}[“"](.+?\.\w+)[”"]',
@@ -250,7 +234,7 @@ _FOLDER_SEARCH_PATTERN = re.compile(
 def extract_file_route_info(
     task_text: str,
 ) -> dict[str, str] | None:
-    """从任务文本抽取文件路线信息(exact path 或 folder+search)。"""
+    """从任务文本抽取明确文件路径或文件夹搜索信息。"""
     exact = _FOLDER_FILE_PATTERN.search(task_text)
     if exact:
         return {
@@ -270,7 +254,7 @@ def extract_file_route_info(
 
 
 def build_file_open_route(folder: str, filename: str) -> SemanticRoute:
-    """构造 exact-path 路线：先进入目录，再由地址栏打开完整文件。"""
+    """构造通过资源管理器地址栏打开精确文件路径的路线。"""
     folder_path = str(_DESKTOP / folder)
     full_path = str(_DESKTOP / folder / filename)
     steps = [
@@ -314,7 +298,7 @@ def build_file_search_route(
     substring: str,
     extension: str,
 ) -> SemanticRoute:
-    """构造 folder+search 路线:Explorer→folder→Ctrl+F→搜索→Enter。"""
+    """构造资源管理器文件夹内搜索路线。"""
     folder_path = str(_DESKTOP / folder)
     steps = [
         SemanticRouteStep(
@@ -371,7 +355,7 @@ def extract_browser_search_info(task_text: str) -> BrowserSearchInfo | None:
 
 
 def build_browser_search_route(query: str) -> SemanticRoute:
-    """构造当前浏览器搜索路线：地址栏、关键词、提交、等待。"""
+    """构造当前浏览器地址栏搜索路线。"""
     return SemanticRoute(
         name="browser_search",
         steps=[
@@ -397,11 +381,11 @@ def build_browser_search_route(query: str) -> SemanticRoute:
 
 
 def normalize_calculator_expression(expression: str) -> str | None:
-    """验证窄算术语法并返回 Calculator 可键入形式，不计算结果。
+    """验证受限算术语法并返回 Calculator 可键入形式，不计算结果。
 
-    只接受十进制数字、二元 ``+ - * /``、小数点和最多八层括号；
-    ``×``/``÷`` 仅转换为对应键盘符号。任何其它字符、缺操作数、
-    隐式乘法或不配对括号都 fail closed。
+    只接受十进制数字、二元 ``+ - * /``、小数点和最多八层括号；``×`` 与
+    ``÷`` 仅转换为对应键盘符号。任何其它字符、缺操作数、隐式乘法或括号
+    不配对都返回 None。
     """
     if not isinstance(expression, str):
         raise TypeError("expression 必须是 str。")
@@ -439,7 +423,7 @@ def normalize_calculator_expression(expression: str) -> str | None:
 
 
 def extract_calculator_expression(task_text: str) -> str | None:
-    """从明确计算指令抽取安全表达式；非计算任务返回 None。"""
+    """从明确计算指令中抽取安全表达式；非计算任务返回 None。"""
     if not isinstance(task_text, str) or not task_text.strip():
         return None
     match = _CALCULATOR_TASK_PATTERN.search(task_text)
@@ -460,12 +444,12 @@ def calculator_foreground_is_reliable(
 
 
 def calculator_title_keywords() -> tuple[str, ...]:
-    """返回只用于内存窗口身份核验的 Calculator 标题别名。"""
+    """返回用于内存窗口身份核验的 Calculator 标题别名。"""
     return _CALCULATOR_TITLE_KEYWORDS
 
 
 def build_calculator_expression_route(expression: str) -> SemanticRoute:
-    """构造 Calculator 键盘输入与提交路线；不在进程内求值。"""
+    """构造 Calculator 键盘输入与提交路线，不在进程内求值。"""
     normalized = normalize_calculator_expression(expression)
     if normalized is None:
         raise ValueError("expression 不是受支持的 Calculator 算术表达式。")
@@ -484,12 +468,7 @@ def build_calculator_expression_route(expression: str) -> SemanticRoute:
     )
 
 
-# ========================================================================
-# PART A: App-launch keyboard-native route
-# ========================================================================
-
-# 常用应用名称映射:任务文本中的名称 → 系统搜索文本 + 进程标识。
-# 进程标识用于 completion verifier 的 foreground 匹配。
+# 常用应用名称映射：任务文本中的名称对应系统搜索文本与进程标识。
 APP_LAUNCH_MAPPINGS = {
     "chrome": {
         "search_text": "Chrome",
@@ -524,7 +503,7 @@ APP_LAUNCH_MAPPINGS = {
     },
 }
 
-# 纯启动 intent 模式:"打开/启动/运行 X"(不含"文件/网页/搜索/文件夹")。
+# 只匹配“打开/启动/运行 X”一类纯应用启动指令。
 _APP_LAUNCH_PATTERN = re.compile(
     r"^(?:打开|启动|运行|打开并让.{0,10}显示)(.+?)(?:[，,。.]|$)",
 )
@@ -537,16 +516,14 @@ _APP_LAUNCH_EXCLUSIONS = re.compile(
 def extract_app_launch_info(
     task_text: str,
 ) -> "AppLaunchInfo | None":
-    """从纯应用启动 intent 抽取 app 信息;非启动任务返回 None。
+    """从纯应用启动任务中抽取应用信息，复杂任务返回 None。
 
-    仅匹配"打开/启动 X"的简短指令;排除全文含文件/搜索/保存/计算等
-    复杂动词的指令(它们有专用路线或需模型自主决策)。
+    含文件、搜索、保存、计算等复杂动词的任务不会进入该路线，而应由专用
+    路线或模型继续决策。
     """
     text = task_text.strip()
-    # 全文级排除:含复杂任务动词的指令不是纯启动。
     if _APP_LAUNCH_EXCLUSIONS.search(text):
         return None
-    # 截断到第一个分句,只分析"打开 X"部分。
     head = re.split(r"[,，。;；]", text)[0]
     match = _APP_LAUNCH_PATTERN.match(head)
     if match is None:
@@ -571,7 +548,7 @@ def extract_app_launch_info(
 
 @dataclass(frozen=True)
 class AppStateSnapshot:
-    """任务开始时目标应用的可见窗口与前台状态(用于 before/after 判定)。"""
+    """保存任务开始时目标应用的可见窗口与前台状态。"""
 
     target_app: str
     target_hwnds: frozenset[int]
@@ -582,7 +559,7 @@ class AppStateSnapshot:
 def snapshot_app_state(
     process_names: tuple[str, ...],
 ) -> AppStateSnapshot:
-    """枚举当前目标进程的可见顶层窗口 HWND + 前台状态。"""
+    """枚举目标进程当前可见窗口并记录前台状态。"""
     import ctypes
     import time as _time
 
@@ -610,7 +587,7 @@ def snapshot_app_state(
 
 
 def _process_name_of(pid: int) -> str:
-    """查询进程完整映像名;失败返回空串(只读,OpenProcess/CloseHandle 配对)。"""
+    """查询进程完整映像名，失败时返回空字符串。"""
     import ctypes
 
     handle = ctypes.windll.kernel32.OpenProcess(0x1000, False, pid)
@@ -631,7 +608,7 @@ def _process_name_of(pid: int) -> str:
 
 
 def process_name_of_hwnd(hwnd: int) -> str:
-    """返回 HWND 所属进程名;失败返回空串。"""
+    """返回 HWND 所属进程名，失败时返回空字符串。"""
     import ctypes
 
     pid = ctypes.c_ulong()
@@ -640,10 +617,9 @@ def process_name_of_hwnd(hwnd: int) -> str:
 
 
 def enumerate_save_dialog_windows() -> list[dict]:
-    """枚举当前所有可见 #32770 对话框窗口(hwnd/process/title/foreground)。
+    """枚举当前可见的 Windows 标准对话框。
 
-    P2 对话框转移检测的通用事实来源:类名 #32770 是 Windows 原生
-    Save/Save-As 等标准对话框的宿主类;仅收集结构化身份,不含内容。
+    返回窗口句柄、进程、标题和前台状态等结构化身份信息，不读取对话框内容。
     """
     import ctypes
 
@@ -676,7 +652,7 @@ def enumerate_save_dialog_windows() -> list[dict]:
     return dialogs
 
 
-# 支持安全新建窗口快捷键的应用(Chrome 用 Ctrl+N 创建独立 HWND)。
+# 对支持标准“新建窗口”快捷键的应用，在已有实例时可请求独立新窗口。
 _APP_NEW_WINDOW_SHORTCUTS = {
     "chrome": ("ctrl", "n"),
 }
@@ -687,10 +663,10 @@ def build_app_launch_route(
     app_id: str = "",
     pre_existing: bool = False,
 ) -> SemanticRoute:
-    """构造 app-launch 键盘路线(CASE A/B)。
+    """构造通过 Windows 搜索启动应用的键盘路线。
 
-    CASE A(无已有窗口):Win→type→Enter→wait(启动新实例)。
-    CASE B(已有窗口):Win→type→Enter→wait→Ctrl+N(新建独立窗口)。
+    没有已有窗口时直接搜索并启动；已有且应用支持标准新建窗口快捷键时，
+    在激活应用后再创建独立窗口。
     """
     steps = [
         SemanticRouteStep(
@@ -734,9 +710,9 @@ def build_app_launch_route(
 def build_transfer_paste_route(
     prefix_text: str | None = None,
 ) -> SemanticRoute:
-    """构造 P3 粘贴路线:可选前置标题 → Ctrl+V(经真实键盘)。
+    """构造可选前置文本加粘贴的跨应用键盘路线。
 
-    prefix 为 None 时不发明内容,直接粘贴(§18 no-prefix 分支)。
+    ``prefix_text`` 为 None 时不补造内容，直接执行粘贴。
     """
     steps = []
     if prefix_text is not None:
