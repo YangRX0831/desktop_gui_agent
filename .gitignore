@@ -38,7 +38,7 @@ model_cache/
 .DS_Store
 Thumbs.db
 
-# Acceptance harness source is version-controlled; only generated artifacts stay local.
+# Benchmark artifacts generated during local runs
 benchmark/reports/*
 !benchmark/reports/PAIRED_20260821_192024/
 benchmark/reports/PAIRED_20260821_192024/*
@@ -64,7 +64,7 @@ run_api.bat
 diagnostics_feature_plan.md
 周报_*.md
 
-# Local governance and authority materials (never commit, per AGENTS.md 6.3)
+# Local project-management and source-material files
 AGENTS.md
 项目进度与验收.md
 *.pdf
