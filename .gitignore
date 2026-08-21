@@ -38,14 +38,11 @@ model_cache/
 .DS_Store
 Thumbs.db
 
-# Acceptance harness source is version-controlled; only generated artifacts stay local.
+# Benchmark source is version-controlled; generated run artifacts stay local by default.
 benchmark/reports/*
 !benchmark/reports/PAIRED_20260821_192024/
 benchmark/reports/PAIRED_20260821_192024/*
 !benchmark/reports/PAIRED_20260821_192024/paired_results.jsonl
-!benchmark/reports/PAIRED_20260821_224007/
-benchmark/reports/PAIRED_20260821_224007/*
-!benchmark/reports/PAIRED_20260821_224007/paired_results.jsonl
 benchmark/screenshots/
 benchmark/.tmp/
 benchmark/tmp/
@@ -53,7 +50,6 @@ benchmark/**/*.jsonl
 benchmark/**/*_before.png
 benchmark/**/*_after.png
 !benchmark/reports/PAIRED_20260821_192024/paired_results.jsonl
-!benchmark/reports/PAIRED_20260821_224007/paired_results.jsonl
 reports/quality/*
 desktop_gui_agent_final_docs*.zip
 .zcode/
