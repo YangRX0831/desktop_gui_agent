@@ -1,20 +1,12 @@
-"""提供桌面 GUI 智能体的最小运行配置。
+"""提供桌面 GUI 智能体的运行配置与环境变量解析。
 
-职责：
-    ``AppConfig`` 是 CLI 与 ``GuiAgent`` 之间唯一的运行配置快照；默认
-    ``max_steps`` 和 ``retry_count`` 也只在本模块定义，避免入口和编排器
-    分别复制数值后发生漂移。
+``AppConfig`` 保存命令行入口与 ``GuiAgent`` 之间的运行配置快照。默认
+``max_steps`` 和 ``retry_count`` 统一在本模块定义，避免入口与编排层重复
+维护数值。
 
-校验约束：
-    所有类型和值域在构造时验证，后端、截图和控制器尚未创建，因此非法
-    配置不会产生外部副作用。bool 不作为 int 接受。
-
-环境边界：
-    本地模型路径只能由专用环境变量读取，空值视为未配置。读取函数不创建
-    目录、不加载模型，也不修改进程或系统环境。
-
-该模块不保存 API key。DashScope 凭据由专用后端在其环境边界读取，避免
-把秘密信息混入可打印的通用配置对象。
+所有类型和值域都在配置对象构造时验证。环境变量读取函数只负责解析配置，
+不会创建目录、加载模型或修改系统环境。本模块不保存 API 密钥；DashScope
+凭据由专用后端在调用边界读取。
 """
 
 import logging
@@ -26,27 +18,22 @@ from typing import Literal, cast
 ModelMode = Literal["local", "api"]
 CoordinateMode = Literal["image_pixel", "normalized_1000"]
 LocalRuntime = Literal["transformers", "openvino"]
-# PRD 4.4.1 默认步数上限 10;可通过 CLI --max-steps 调整。
+# PRD 4.4.1 默认基础步数为 10，可通过 CLI --max-steps 调整。
 DEFAULT_MAX_STEPS = 10
 DEFAULT_RETRY_COUNT = 3
-# 决策协议 V2 feature flag:False=保持 V1 行为,True=启用 observe 动作、
-# V2 System Prompt、system/user 消息分层与 temperature=0 的实验协议。
+# 决策协议版本开关。V2 保留 observe 等兼容行为，V3 为当前默认协议。
 DECISION_PROTOCOL_V2_ENV = "GUI_AGENT_DECISION_PROTOCOL_V2"
 DECISION_PROTOCOL_V3_ENV = "GUI_AGENT_DECISION_PROTOCOL_V3"
-# benchmark/实验模式:任务 run 期间最小化 Agent 自身控制窗口,避免 CLI
-# 进入模型视野诱导模型点击自身界面;默认关闭,不改变正常用户模式行为。
+# 测试运行期间可最小化 Agent 自身控制窗口，避免其进入模型截图。
 HIDE_OWN_WINDOW_ENV = "GUI_AGENT_HIDE_OWN_WINDOW_DURING_RUN"
-# SEMANTIC EXECUTION PHASE 2A:程序化 Completion Verifier + Minimal
-# Progress State。默认关闭;开启时 finish 需过三态程序验证,并注入
-# completion/progress 动态状态字段(不修改 V3 静态 Prompt)。
+# 程序化完成验证与进度状态开关。未显式设置时由调用方结合协议版本决定。
 SEMANTIC_EXECUTION_ENV = "GUI_AGENT_SEMANTIC_EXECUTION"
-# observe() 的固定等待秒数(程序决定,模型不可指定);允许范围 0.3-1.0。
+# observe() 的固定等待秒数由程序控制，模型不能指定。
 OBSERVE_WAIT_SECONDS = 0.6
 DEFAULT_LOG_LEVEL = "INFO"
 DEFAULT_LOG_DIR = Path("logs")
 LOCAL_MODEL_DIR_ENV = "GUI_AGENT_LOCAL_MODEL_DIR"
-# 本地推理双路线:transformers 为 canonical 默认,openvino 为纯 CPU
-# 环境的加速路线,经环境变量显式选择。
+# 本地推理支持 Transformers 与 OpenVINO 两种运行时，由环境变量显式选择。
 LOCAL_RUNTIME_ENV = "GUI_AGENT_LOCAL_RUNTIME"
 OPENVINO_MODEL_DIR_ENV = "GUI_AGENT_OPENVINO_MODEL_DIR"
 DEFAULT_LOCAL_RUNTIME: LocalRuntime = "transformers"
@@ -54,13 +41,9 @@ COORDINATE_MODE_ENV = "GUI_AGENT_COORDINATE_MODE"
 TRACE_ENV = "GUI_AGENT_TRACE"
 DEFAULT_COORDINATE_MODE: CoordinateMode = "normalized_1000"
 MODEL_IMAGE_MAX_DIM_ENV = "GUI_AGENT_MODEL_IMAGE_MAX_DIM"
-# 模型输入图像长边上限(像素):超过时等比缩放。1280 兼顾 UI 细节与
-# visual token 数量;可通过环境变量调整,适配不同模型能力。
+# API 模型输入图像长边上限；超过时等比缩放以控制视觉 token 数量。
 DEFAULT_MODEL_IMAGE_MAX_DIM = 1280
-# local 模式专用长边上限(P5):2B 本地模型 visual token 随尺寸超线性
-# 增长,1280 时 warm 推理远超 PRD 3s 门槛;640 实测 warm 2.9s 达标,
-# 且 local compact 路线为键盘优先、对视觉细节依赖低。API 模式不受
-# 影响,仍用上面的 1280。
+# 本地模型使用较小图像上限以降低视觉 token 数量和 CPU 推理开销。
 LOCAL_MODEL_IMAGE_MAX_DIM_ENV = "GUI_AGENT_LOCAL_IMAGE_MAX_DIM"
 DEFAULT_LOCAL_MODEL_IMAGE_MAX_DIM = 640
 API_MODEL_ENV = "DASHSCOPE_API_MODEL"
@@ -73,22 +56,24 @@ DEFAULT_API_THINKING_OPTIONS_SUPPORTED = True
 
 @dataclass(frozen=True)
 class AppConfig:
-    """保存 CLI 与 production dependency wiring 所需的最小配置。
+    """保存命令行入口与生产运行组件所需的配置。
 
     Attributes:
         model_mode: 模型调用模式。
-        max_steps: 单任务基础 logical step 上限；符合推进条件时可有界扩展。
+        max_steps: 单任务基础逻辑步数上限；符合推进条件时可有界扩展。
         log_level: 标准库日志级别。
-        log_dir: 周期日志输出目录。
+        log_dir: 运行日志输出目录。
         retry_count: 已解析动作执行失败后的单步重试上限。
         local_model_dir: 可选的本地模型目录。
-        coordinate_mode: 模型 click 坐标使用截图像素或 0..1000 相对坐标。
-        api_model: API 模型名称;None 表示未配置。
-        api_enable_thinking: thinking 三态覆盖;None 表示不发送该字段。
+        coordinate_mode: 模型点击坐标使用截图像素或 0..1000 相对坐标。
+        local_runtime: 本地模型运行时。
+        openvino_model_dir: 可选的 OpenVINO 模型目录。
+        api_model: API 模型名称；None 表示未配置。
+        api_enable_thinking: thinking 三态覆盖；None 表示不发送该字段。
         api_thinking_budget: 可选 thinking token budget。
-        api_thinking_options_supported: provider 是否支持 thinking 字段。
+        api_thinking_options_supported: 服务端是否支持 thinking 字段。
 
-    CLI 使用 ``config_from_arguments`` 创建该对象，再交给 production wiring。
+    CLI 使用 ``config_from_arguments`` 创建该对象，再交给生产运行组件组装。
     """
 
     model_mode: ModelMode = "local"
@@ -167,7 +152,7 @@ class AppConfig:
 
     @staticmethod
     def _validate_retry_count(value: object) -> None:
-        """把单步重试限制在 PRD 默认上限三次以内。"""
+        """把单步重试限制在默认上限三次以内。"""
         if type(value) is not int:
             raise TypeError("retry_count 必须是 int。")
         if not 0 <= value <= DEFAULT_RETRY_COUNT:
@@ -176,7 +161,7 @@ class AppConfig:
 
 @dataclass(frozen=True)
 class GuiAgentSettings:
-    """保存 PRD 4.4.1 任务循环的运行设置。"""
+    """保存任务循环使用的运行设置。"""
 
     max_steps: int = DEFAULT_MAX_STEPS
     retry_count: int = DEFAULT_RETRY_COUNT
@@ -190,7 +175,7 @@ class GuiAgentSettings:
     semantic_execution: bool = False
 
     def __post_init__(self) -> None:
-        """在 Agent 创建副作用依赖前验证全部设置。"""
+        """在 Agent 创建带副作用的依赖前验证全部设置。"""
         AppConfig._validate_positive_integer(self.max_steps, "max_steps")
         AppConfig._validate_retry_count(self.retry_count)
         if self.model_mode not in {"local", "api"}:
@@ -220,7 +205,7 @@ def local_model_dir_from_env() -> Path | None:
 
 
 def local_model_image_max_dim_from_env() -> int:
-    """读取 local 模式图像长边上限;未配置时使用 640(P5 性能口径)。"""
+    """读取本地模型图像长边上限，未配置时使用默认值 640。"""
     value = os.environ.get(LOCAL_MODEL_IMAGE_MAX_DIM_ENV)
     if value is None or not value.strip():
         return DEFAULT_LOCAL_MODEL_IMAGE_MAX_DIM
@@ -238,7 +223,7 @@ def local_model_image_max_dim_from_env() -> int:
 
 
 def model_image_max_dim_from_env() -> int:
-    """读取模型输入图像长边上限;未配置时使用默认值。"""
+    """读取 API 模型输入图像长边上限，未配置时使用默认值。"""
     value = os.environ.get(MODEL_IMAGE_MAX_DIM_ENV)
     if value is None or not value.strip():
         return DEFAULT_MODEL_IMAGE_MAX_DIM
@@ -256,7 +241,7 @@ def model_image_max_dim_from_env() -> int:
 
 
 def api_model_from_env() -> str | None:
-    """读取 API 模型名称;空值视为未配置。"""
+    """读取 API 模型名称，空值视为未配置。"""
     value = os.environ.get(API_MODEL_ENV)
     if value is None or not value.strip():
         return None
@@ -264,7 +249,7 @@ def api_model_from_env() -> str | None:
 
 
 def api_enable_thinking_from_env() -> bool | None:
-    """读取 thinking 三态覆盖;未设置保持当前产品默认关闭。"""
+    """读取 thinking 三态覆盖，未设置时保持默认关闭。"""
     value = os.environ.get(API_ENABLE_THINKING_ENV)
     if value is None:
         return DEFAULT_API_ENABLE_THINKING
@@ -281,7 +266,7 @@ def api_enable_thinking_from_env() -> bool | None:
 
 
 def api_thinking_budget_from_env() -> int | None:
-    """读取可选 thinking budget;未设置或空值时不发送 override。"""
+    """读取可选 thinking budget，未设置或空值时不发送覆盖值。"""
     value = os.environ.get(API_THINKING_BUDGET_ENV)
     if value is None or not value.strip():
         return None
@@ -294,7 +279,7 @@ def api_thinking_budget_from_env() -> int | None:
 
 
 def api_thinking_options_supported_from_env() -> bool:
-    """读取 provider thinking capability;默认使用当前 DashScope 能力。"""
+    """读取服务端 thinking 能力开关，默认使用当前 DashScope 能力。"""
     value = os.environ.get(API_THINKING_OPTIONS_SUPPORTED_ENV)
     if value is None:
         return DEFAULT_API_THINKING_OPTIONS_SUPPORTED
@@ -309,7 +294,7 @@ def api_thinking_options_supported_from_env() -> bool:
 
 
 def local_runtime_from_env() -> LocalRuntime:
-    """读取本地推理运行时;未配置时保持 transformers canonical 默认。"""
+    """读取本地推理运行时，未配置时使用 Transformers。"""
     value = os.environ.get(LOCAL_RUNTIME_ENV, DEFAULT_LOCAL_RUNTIME)
     normalized = value.strip().lower()
     if normalized not in {"transformers", "openvino"}:
@@ -328,14 +313,17 @@ def openvino_model_dir_from_env() -> Path | None:
 
 
 def decision_protocol_v2_from_env() -> bool:
-    """读取决策协议 V2 开关;默认 False(保持 V1 行为)。"""
+    """读取决策协议 V2 开关，默认关闭。"""
     value = os.environ.get(DECISION_PROTOCOL_V2_ENV, "")
     return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
 def decision_protocol_v3_from_env() -> bool:
-    """读取决策协议 V3 开关;未设置时默认 True(2026-08-19 起 CLEAN V3
-    为研发 baseline)。显式设为 0/false/no/off 回到 V1;与 V2 互斥,V3 优先。"""
+    """读取决策协议 V3 开关；未设置时默认启用。
+
+    显式设置为 0、false、no 或 off 时关闭。V3 与 V2 同时开启时由调用方
+    按当前协议优先级处理。
+    """
     value = os.environ.get(DECISION_PROTOCOL_V3_ENV)
     if value is None:
         return True
@@ -343,11 +331,7 @@ def decision_protocol_v3_from_env() -> bool:
 
 
 def semantic_execution_from_env() -> bool | None:
-    """读取 SEMANTIC EXECUTION 开关;未设置返回 None 交给调用方解析。
-
-    未设置时随研发默认协议 CLEAN V3 一同启用(2026-08-19 pre-acceptance
-    起);显式 0/false/no/off 关闭;显式选择 V1/V2 时保持旧行为不启用。
-    """
+    """读取程序化完成验证开关，未设置时返回 None 交由调用方决定。"""
     value = os.environ.get(SEMANTIC_EXECUTION_ENV)
     if value is None:
         return None
@@ -355,19 +339,19 @@ def semantic_execution_from_env() -> bool | None:
 
 
 def hide_own_window_during_run_from_env() -> bool:
-    """读取 run 期间最小化自身控制窗口开关;默认 False。"""
+    """读取任务运行期间最小化自身控制窗口的开关，默认关闭。"""
     value = os.environ.get(HIDE_OWN_WINDOW_ENV, "")
     return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
 def trace_enabled_from_env() -> bool:
-    """读取 debug/benchmark 模式的 agent trace 开关;默认关闭。"""
+    """读取 Agent 决策追踪开关，默认关闭。"""
     value = os.environ.get(TRACE_ENV, "")
     return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
 def coordinate_mode_from_env() -> CoordinateMode:
-    """读取模型坐标模式；未配置时使用 Qwen-VL 相对坐标基线。"""
+    """读取模型坐标模式，未配置时使用 0..1000 相对坐标。"""
     value = os.environ.get(COORDINATE_MODE_ENV, DEFAULT_COORDINATE_MODE)
     normalized = value.strip().lower()
     if normalized not in {"image_pixel", "normalized_1000"}:
