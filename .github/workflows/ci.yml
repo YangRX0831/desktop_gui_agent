@@ -1,14 +1,7 @@
-# P6 最小质量门禁(CS-TOOL-002)。
-# 覆盖:pytest tests/、benchmark self-tests、black/isort/flake8 全树、
-# production mypy(canonical 命令,硬门)。
-# 说明:
-# - CI 只安装测试收集期真实导入的依赖子集(agentscope/mss/pillow/
-#   numpy/opencv-python);PaddleOCR/PyTorch/OpenVINO 属 PRD 环境层,
-#   由 verify_env.py 与 README 环境说明覆盖,不在 CI 安装。
-# - production mypy 使用与本地 canonical 相同的环境形态:解释器无
-#   agentscope 包,--ignore-missing-imports 将其按缺失处理,复现
-#   PRODUCTION_MYPY=0 口径。tests/benchmark 的类型债务为渐进项,
-#   不纳入硬门(见 README"已知限制")。
+# Continuous integration for tests and code-quality checks.
+# The workflow installs only the lightweight dependencies required by the
+# automated test suite. Optional OCR and local-model runtimes are validated
+# separately through verify_env.py and the deployment documentation.
 name: ci
 
 on:
@@ -45,9 +38,9 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.10"
-      - name: Install mypy only (canonical no-agentscope form)
+      - name: Install mypy
         run: python -m pip install --upgrade pip && python -m pip install mypy
-      - name: production mypy (hard gate)
+      - name: production mypy
         run: >
           python -m mypy --ignore-missing-imports
           config.py main.py verify_env.py agent perception control utils
