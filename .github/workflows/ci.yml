@@ -1,5 +1,6 @@
 # 非 GUI 自动化质量检查。
-# GUI 任务依赖真实 Windows 桌面环境，不在该工作流中执行。
+# 项目生产代码面向 Windows，并直接使用 Windows ctypes API，因此测试和类型
+# 检查均在 Windows runner 上执行。真实 GUI 任务仍不在 CI 中运行。
 name: ci
 
 on:
@@ -8,7 +9,7 @@ on:
 
 jobs:
   tests-and-quality:
-    runs-on: ubuntu-latest
+    runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -17,7 +18,7 @@ jobs:
       - name: Install test-time dependencies
         run: >
           python -m pip install --upgrade pip &&
-          python -m pip install pytest agentscope mss pillow numpy opencv-python
+          python -m pip install pytest "agentscope>=1.0,<2" "mcp>=1.13,<2" mss pillow numpy opencv-python
       - name: pytest tests/
         run: python -B -m pytest tests -q -p no:cacheprovider
       - name: benchmark self-tests
@@ -30,8 +31,6 @@ jobs:
         run: python -m pip install flake8 && python -m flake8 --max-line-length=88 --extend-ignore=E203,W503 agent perception control utils tools main.py config.py verify_env.py tests benchmark
 
   mypy-production:
-    # 生产代码包含 Windows 专用 ctypes API；Windows runner 才能使用与目标
-    # 平台一致的 typeshed 定义，避免 Linux 上对 windll/WinDLL 的伪报错。
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
