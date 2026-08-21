@@ -1,4 +1,4 @@
-# Python bytecode and caches
+# Python 字节码、缓存和构建产物
 __pycache__/
 *.py[cod]
 *.pyc
@@ -11,19 +11,19 @@ build/
 dist/
 *.egg-info/
 
-# Runtime artifacts (logs, screenshots, model output)
+# 运行日志、截图和模型输出
 logs/
 *.log
 *.err
 
-# Environment and secrets
+# 本地环境与凭据
 .env
 .env.*
 *.key
 .venv/
 venv/
 
-# Local model weights and OCR/model caches (must live outside the repo)
+# 本地模型权重与模型缓存
 *.bin
 *.safetensors
 *.onnx
@@ -31,14 +31,14 @@ venv/
 *.gguf
 model_cache/
 
-# Editor / OS
+# 编辑器与操作系统文件
 .vscode/
 .idea/
 *.swp
 .DS_Store
 Thumbs.db
 
-# Acceptance harness source is version-controlled; only generated artifacts stay local.
+# Benchmark 源码纳入版本控制；生成的运行产物默认保存在本地
 benchmark/reports/*
 !benchmark/reports/PAIRED_20260821_192024/
 benchmark/reports/PAIRED_20260821_192024/*
@@ -64,7 +64,7 @@ run_api.bat
 diagnostics_feature_plan.md
 周报_*.md
 
-# Local governance and authority materials (never commit, per AGENTS.md 6.3)
+# 本地项目管理材料和需求原文
 AGENTS.md
 项目进度与验收.md
 *.pdf
