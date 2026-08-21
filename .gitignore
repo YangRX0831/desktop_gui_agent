@@ -55,8 +55,6 @@ benchmark/**/*_after.png
 !benchmark/reports/PAIRED_20260821_192024/paired_results.jsonl
 !benchmark/reports/PAIRED_20260821_224007/paired_results.jsonl
 reports/quality/*
-!reports/quality/quality_20260821_233957.json
-!reports/quality/quality_20260821_233957.md
 desktop_gui_agent_final_docs*.zip
 .zcode/
 diagnostics_feature_plan.md
