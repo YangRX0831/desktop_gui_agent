@@ -1,4 +1,4 @@
-"""稳定版 canonical V3 八动作 System Prompt 与动态 User Prompt 组装。"""
+"""V3 八动作系统提示词与动态用户提示词组装。"""
 
 from agent.action_parser import (
     ActionPromptState,
@@ -73,5 +73,5 @@ def compose_action_prompt_v3(
     state: ActionPromptState,
     coordinate_mode: str,
 ) -> str:
-    """组装 V3 动态 User Prompt，复用既有可信状态与 recovery 块。"""
+    """组装 V3 动态用户提示词，复用当前执行状态与恢复信息。"""
     return compose_action_dynamic_prompt(task, state, coordinate_mode)
