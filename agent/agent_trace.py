@@ -1,9 +1,9 @@
-"""决策协议共用的 debug/benchmark 追踪写入器。
+"""记录模型决策与步骤截图，供本地调试和 Benchmark 分析使用。
 
-默认关闭(GUI_AGENT_TRACE 开启);记录每次模型调用的完整决策证据与
-每步 before/after 截图,供失败分类(perception/grounding/policy/
-parsing/execution/completion)与 benchmark 指标聚合使用。凭据类信息
-硬禁;不估算 token(usage 缺失时记 unknown)。
+该功能默认关闭，可通过 ``GUI_AGENT_TRACE`` 启用。追踪文件可能包含
+模型调用和界面状态信息，因此只应保存在本地受控目录中。写入器不会对
+调用方传入的任意字段执行内容脱敏，调用方不得传入 API Key、密码、Token
+等凭据或其他不应落盘的敏感信息。
 """
 
 import json
@@ -18,10 +18,10 @@ _UNKNOWN = "unknown"
 
 
 class AgentTraceWriterProtocol(Protocol):
-    """编排器需要的最小 trace 合同;测试可注入内存 fake。"""
+    """定义编排器使用的最小追踪写入接口。"""
 
     def record_model_call(self, fields: dict[str, object]) -> None:
-        """追加一条模型调用/决策记录。"""
+        """追加一条模型调用或决策记录。"""
 
     def save_step_screenshot(
         self,
@@ -30,16 +30,16 @@ class AgentTraceWriterProtocol(Protocol):
         phase: str,
         image: object,
     ) -> None:
-        """保存某步的 before/after/observe 截图。"""
+        """保存某一步骤的 before、after 或 observe 截图。"""
 
 
 def default_trace_dir(log_dir: Path) -> Path:
-    """返回 trace 根目录 logs/agent_trace/。"""
+    """返回追踪文件根目录 ``logs/agent_trace/``。"""
     return log_dir / "agent_trace"
 
 
 class AgentTraceWriter:
-    """把决策追踪写入 logs/agent_trace/<run_id>.jsonl 与截图目录。"""
+    """把决策追踪写入 JSONL 文件及对应的步骤截图目录。"""
 
     def __init__(self, log_dir: Path) -> None:
         if not isinstance(log_dir, Path):
@@ -47,7 +47,7 @@ class AgentTraceWriter:
         self._root = default_trace_dir(log_dir)
 
     def record_model_call(self, fields: dict[str, object]) -> None:
-        """追加一条 JSONL 记录;写入失败只记安全日志不抛出。"""
+        """追加一条 JSONL 记录；写入失败只记录异常类型，不影响主流程。"""
         try:
             self._root.mkdir(parents=True, exist_ok=True)
             run_id = str(fields.get("run_id", "unknown"))
@@ -74,7 +74,7 @@ class AgentTraceWriter:
         phase: str,
         image: object,
     ) -> None:
-        """按 step_XX_before/after/observe 命名保存截图;失败不抛出。"""
+        """按步骤编号和阶段保存截图；写入失败不影响主流程。"""
         try:
             directory = self._root / run_id
             directory.mkdir(parents=True, exist_ok=True)
