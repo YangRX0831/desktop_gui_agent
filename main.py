@@ -1,20 +1,10 @@
-"""提供桌面 GUI 智能体的最小命令行 vertical-slice 入口。
+"""提供桌面 GUI 智能体的命令行入口。
 
-职责：
-    解析运行参数、配置日志、延迟组装 production 依赖，并实现 PRD 4.4.2
-    的欢迎语、退出说明、任务输入、步骤动作和成功/失败结果展示。
+本模块负责解析运行参数、配置日志、延迟组装运行依赖，并实现欢迎语、退出
+说明、任务输入、步骤动作和成功或失败结果展示。
 
-构造约束：
-    production 后端只在收到第一项非空任务后创建；请求 exit、空输入或仅
-    解析参数不会加载模型、截图、创建控制器或读取桌面。
-
-展示与日志：
-    CLI 是用户主动查看的交互界面，按 PRD 显示已验证动作的完整参数。
-    logging 是持久化诊断通道，只记录固定脱敏事件，不能复用 CLI 正文。
-
-依赖方向：
-    具体 Agent、模型和控制器采用函数内延迟导入，目的仅是保持无副作用
-    CLI 导入边界，不作为掩盖循环依赖的手段。
+模型、截图和控制器只在创建运行实例时初始化。具体 Agent、模型和控制器采用
+函数内延迟导入，以保持模块导入阶段无桌面和模型副作用。
 """
 
 import argparse
@@ -61,7 +51,7 @@ from perception.screenshot import (
 )
 from utils.logger import setup_logging
 
-# PRD 4.4.2 交互示例逐字文案。欢迎使用桌面GUI智能体！输入'exit'退出程序。
+# PRD 4.4.2 规定的命令行交互文案。
 WELCOME_MESSAGE = "欢迎使用桌面GUI智能体！"
 EXIT_INSTRUCTION = "输入'exit'退出程序"
 EXIT_MESSAGE = "程序已退出。"
@@ -74,12 +64,9 @@ OPENVINO_MODEL_CONFIGURATION_MESSAGE = (
 
 
 class _Agent(Protocol):
-    """描述 CLI 调用 AgentScope 智能体的最小异步接口。
+    """描述命令行入口调用智能体所需的最小异步接口。
 
-    Attributes:
-        具体任务状态由 Agent 实现私有保存，CLI 不读取内部属性。
-
-    production 使用 ``GuiAgent``，测试可注入只产生内存消息的 fake。
+    运行时使用 ``GuiAgent``；测试可以注入不产生外部副作用的替代实现。
     """
 
     async def __call__(self, msg: Msg) -> Msg:
@@ -88,8 +75,7 @@ class _Agent(Protocol):
 
 ActionObserver = Callable[[int, ParsedAction], None]
 
-# 相对指代词表:命中时 CLI 从前台时间线解析任务目标窗口。这是通用
-# 语言指代解析,不是应用名或任务答案硬编码。
+# 命中相对指代时，CLI 从前台窗口时间线中解析用户提交任务前的目标窗口。
 _RELATIVE_REFERENCE_KEYWORDS = (
     "当前窗口",
     "当前应用",
@@ -109,16 +95,16 @@ def _has_relative_window_reference(task: str) -> bool:
 
 
 def start_foreground_timeline() -> tuple[deque, threading.Event]:
-    """启动轻量前台时间线监听,记录窗口变化(去重,最近8个)。
+    """启动轻量前台窗口时间线监听并记录最近八次窗口变化。
 
-    用户提交任务时据此回溯CLI聚焦前的业务窗口;线程为daemon,轮询
-    间隔0.5秒,不产生桌面副作用。
+    用户提交任务时可据此回溯 CLI 聚焦前的业务窗口。监听线程为守护线程，
+    每 0.5 秒读取一次前台窗口，不产生桌面控制副作用。
     """
     timeline: deque = deque(maxlen=8)
     stop = threading.Event()
 
     def _poll() -> None:
-        """轮询前台变化并追加时间线,直到收到停止信号。"""
+        """轮询前台窗口变化，直到收到停止信号。"""
         last_seen = 0
         while not stop.is_set():
             hwnd = get_foreground_app_hwnd()
@@ -136,7 +122,7 @@ def resolve_task_target_window(
     timeline: deque,
     required_processes: frozenset[str] | None = None,
 ) -> dict[str, object] | None:
-    """按可选进程类别回溯最近业务窗口；类别缺失时查最上层可见窗口。"""
+    """按可选进程类别回溯最近业务窗口；必要时检查当前可见窗口。"""
     current_fg = get_foreground_app_hwnd()
     for hwnd, process in reversed(list(timeline)):
         process_name = str(process).lower()
@@ -160,36 +146,26 @@ def resolve_task_target_window(
 
 
 class _AgentFactory(Protocol):
-    """定义 CLI 创建 production Agent 的最小合同。"""
+    """定义命令行入口创建智能体所需的最小工厂接口。"""
 
     def __call__(
         self,
         config: AppConfig,
         action_observer: ActionObserver,
     ) -> _Agent:
-        """按配置和展示回调创建 Agent。"""
+        """按配置和展示回调创建智能体。"""
 
 
 class _UnavailableLocalBackend:
-    """阻止 api-only production wiring 意外进入本地模型路径。
-
-    Attributes:
-        本类无可变状态，只实现 ModelBackend 的 generate 形状。
-
-    当 CLI 选择 API 模式时作为占位依赖；任何实际调用都明确失败。
-    """
+    """防止 API 模式的依赖组装意外进入本地模型路径。"""
 
     def generate(self, image: object, prompt: str) -> str:
-        """防止 api-only wiring 意外进入本地模型路径。"""
+        """任何实际调用都明确报告本地模型未配置。"""
         raise RuntimeError(LOCAL_MODEL_CONFIGURATION_MESSAGE)
 
 
 def create_argument_parser() -> argparse.ArgumentParser:
-    """创建不执行模型、截图或控制操作的 CLI 参数解析器。
-
-    Returns:
-        包含模型模式、最大步数、格式重试和日志选项的参数解析器。
-    """
+    """创建命令行参数解析器，不执行模型、截图或控制操作。"""
     parser = argparse.ArgumentParser(description="Desktop GUI Agent")
     parser.add_argument(
         "--model-mode",
@@ -202,7 +178,7 @@ def create_argument_parser() -> argparse.ArgumentParser:
         type=int,
         default=DEFAULT_MAX_STEPS,
         help=(
-            f"单任务基础 logical step 上限；满足可测推进条件时最多扩展 3 步。"
+            f"单任务基础逻辑步数上限；满足可测推进条件时最多扩展 3 步。"
             f"默认：{DEFAULT_MAX_STEPS}。"
         ),
     )
@@ -227,13 +203,13 @@ def create_argument_parser() -> argparse.ArgumentParser:
 
 
 def config_from_arguments(arguments: argparse.Namespace) -> AppConfig:
-    """把已解析 CLI 参数转换为经过验证的项目配置。
+    """把已解析命令行参数转换为经过验证的项目配置。
 
     Args:
         arguments: ``create_argument_parser`` 产生的参数命名空间。
 
     Returns:
-        可直接用于 production wiring 的不可变配置。
+        可直接用于运行组件组装的不可变配置。
 
     Raises:
         TypeError: 参数字段类型不符合 ``AppConfig`` 合同。
@@ -260,14 +236,14 @@ def build_production_agent(
     config: AppConfig,
     action_observer: ActionObserver,
 ) -> _Agent:
-    """按显式配置延迟构造唯一 production 依赖链。
+    """按显式配置延迟构造生产运行依赖链。
 
     Args:
-        config: 已验证的 production 配置。
+        config: 已验证的运行配置。
         action_observer: 接收已解析动作的只读 CLI 展示回调。
 
     Returns:
-        已连接截图、模型、Parser、Dispatcher 和 TaskManager 的 Agent。
+        已连接截图、模型、解析器、分发器和任务管理器的智能体。
 
     Raises:
         ValueError: 本地模式缺少模型目录等必要配置。
@@ -280,9 +256,7 @@ def build_production_agent(
     from control.keyboard_controller import KeyboardController
     from control.mouse_controller import MouseController
 
-    # SEMANTIC EXECUTION 默认策略(2026-08-19 pre-acceptance):未显式
-    # 设置时随研发默认协议 CLEAN V3 启用;显式 V1/V2 保持旧行为不启用;
-    # 任何显式设置(含 =0)按用户选择生效。
+    # 未显式配置时，程序化完成验证跟随 V3 协议启用；显式配置始终优先。
     protocol_v3 = decision_protocol_v3_from_env()
     semantic_execution = semantic_execution_from_env()
     if semantic_execution is None:
@@ -308,11 +282,9 @@ def build_production_agent(
         thinking_budget=config.api_thinking_budget,
         supports_thinking_options=config.api_thinking_options_supported,
     )
-    # fallback_enabled 表示保留 PRD model-load-failure -> API capability;
-    # 真正的远程发送授权由每个 run 显式设置(run-scoped, non-persistent)。
+    # 本地模型加载失败时保留 PRD 规定的 API 回退能力。
     model_client = ModelClient(local_backend, api_backend, fallback_enabled=True)
-    # ActionDispatcher 的动作授权由 GuiAgent 每个 run 新建 PermissionScope 注入,
-    # production wiring 不再使用静态 allow-all authorizer。
+    # 动作分发权限由 GuiAgent 为每个任务创建独立 PermissionScope。
     dispatcher = ActionDispatcher(
         MouseController(),
         KeyboardController(),
@@ -354,19 +326,19 @@ async def run_cli(
     read_input: Callable[[str], str] = input,
     write_output: Callable[[str], None] = print,
 ) -> int:
-    """运行 PRD 4.4.2 命令行交互循环并实时展示动作。
+    """运行命令行交互循环并实时展示已验证动作。
 
     Args:
-        config: production 运行配置。
-        agent_factory: 延迟构造 Agent 的工厂。
+        config: 运行配置。
+        agent_factory: 延迟构造智能体的工厂。
         read_input: 用户输入函数。
         write_output: CLI 文本输出函数。
 
     Returns:
         用户正常退出时返回 0。
 
-    交互终端是用户主动查看的任务界面，可以显示当前动作；业务日志仍只
-    记录脱敏事件，不记录动作参数、用户输入或模型原文。
+    交互终端可以显示当前动作；持久化业务日志仍只记录固定诊断事件，不复用
+    用户输入、动作参数或模型原文。
     """
     write_output("正在初始化感知模块与模型后端...")
     try:
@@ -379,8 +351,7 @@ async def run_cli(
     _clear_screen()
     write_output(WELCOME_MESSAGE)
     write_output(EXIT_INSTRUCTION)
-    # 就绪信号:初始化(含 OCR 预加载)全部完成后发出,供外部测试平台
-    # 判定 CLI 可接收指令,避免盲目等待固定时长。
+    # 初始化完成后写入就绪标记，供外部测试框架判断 CLI 可以接收任务。
     logging.getLogger(__name__).info("cli_ready")
     timeline, stop_watcher = start_foreground_timeline()
     try:
@@ -397,7 +368,7 @@ async def run_cli(
 
 @dataclass(frozen=True)
 class _CliIO:
-    """CLI 控制台 IO 接缝:输入读取与文本输出成对注入(测试假桩同源)。"""
+    """保存可注入的 CLI 输入与输出函数。"""
 
     read_input: Callable[[str], str]
     write_output: Callable[[str], None]
@@ -410,7 +381,7 @@ async def _cli_loop(
     timeline: deque,
     agent: _Agent | None = None,
 ) -> int:
-    """运行指令输入循环;含相对指代时解析目标窗口并管理CLI前后台。"""
+    """运行指令输入循环，并在需要时解析相对窗口指代。"""
     while True:
         try:
             task = console.read_input("请输入指令：")
@@ -449,8 +420,7 @@ async def _cli_loop(
                         "agent_ui_window_hwnd": agent_ui_hwnd,
                     },
                 )
-                # 提交含相对指代任务时,最小化CLI并恢复目标窗口到前台,
-                # 避免CLI遮挡截图与目标歧义;失败均容忍。
+                # 相对指代任务提交后最小化 CLI 并恢复目标窗口，避免遮挡截图。
                 minimize_window(agent_ui_hwnd)
                 activate_window(int(cast(int, target["hwnd"])))
         try:
@@ -468,8 +438,7 @@ async def _cli_loop(
         if isinstance(result.content, str) and result.content.startswith(
             "任务执行失败："
         ):
-            # result.content 已由 GuiAgent 格式化为 "任务执行失败：<reason>",
-            # 直接输出避免重复前缀;PRD 4.4.2 只给出 success literal。
+            # GuiAgent 已包含失败前缀，直接输出避免重复包装。
             console.write_output(result.content)
         else:
             console.write_output(f"任务执行成功：{result.content}")
@@ -479,7 +448,7 @@ async def _cli_loop(
 
 
 def _clear_screen() -> None:
-    """清空终端屏幕;平台差异由系统命令处理,失败时容忍。"""
+    """清空终端屏幕；系统命令失败时由调用环境自行容忍。"""
     import sys
 
     if sys.platform == "win32":
@@ -506,10 +475,10 @@ def _format_statistics(metadata: object) -> str:
 def _action_observer(
     write_output: Callable[[str], None],
 ) -> ActionObserver:
-    """创建符合 PRD 示例的实时步骤展示回调。"""
+    """创建实时步骤展示回调。"""
 
     def _display(step_number: int, action: ParsedAction) -> None:
-        """按 PRD 4.4.2 示例格式显示一个已验证动作。"""
+        """按命令行展示格式输出一个已验证动作。"""
         write_output(
             f"[步骤{step_number}] 执行动作：{_format_action(action)}",
         )
@@ -518,10 +487,10 @@ def _action_observer(
 
 
 def _format_action(action: ParsedAction) -> str:
-    """把已验证动作还原为 CLI 可读格式，不用于业务日志。
+    """把已验证动作还原为 CLI 可读格式，不用于持久化业务日志。
 
-    必须显式覆盖全部动作类型，未知动作类型显式抛 ValueError；新增动作
-    类型时同步补齐分支，防止静默落到错误的参数访问。
+    必须显式覆盖全部动作类型。新增动作时需要同步补齐分支，避免未知动作
+    静默落入错误的参数访问路径。
     """
     if action["action_type"] == "click":
         return f"click(x={action['params']['x']}, y={action['params']['y']})"
