@@ -54,6 +54,16 @@ def gen_pair_id() -> str:
     return time.strftime("PAIRED_%Y%m%d_%H%M%S")
 
 
+def resolve_task_timeout(task_id: str, override: float | None) -> float:
+    """返回任务超时时间；显式覆盖值优先，否则按任务难度选择默认值。"""
+    if override is not None:
+        return override
+    task_cls = TASK_CLASSES.get(task_id)
+    if task_cls is not None and task_cls.difficulty == "简单":
+        return TASK_TIMEOUT
+    return TASK_TIMEOUT_MEDIUM_HIGH
+
+
 def run_arm(
     spec: CaseSpec,
     arm: str,
@@ -222,7 +232,12 @@ def main() -> None:
         default="paired",
         help="acceptance 使用固定验收实例，并启用 V3 与语义验证。",
     )
-    parser.add_argument("--timeout", type=float, default=TASK_TIMEOUT)
+    parser.add_argument(
+        "--timeout",
+        type=float,
+        default=None,
+        help="单任务超时秒数；默认按任务难度使用基准测试预设。",
+    )
     parser.add_argument(
         "--local",
         action="store_true",
@@ -296,15 +311,7 @@ def main() -> None:
                         arm.upper(),
                         spec.instruction[:50],
                     )
-                    # 未显式指定超时时，简单任务和中高难度任务分别采用统一常量。
-                    arm_timeout = args.timeout
-                    if arm_timeout is None:
-                        task_cls = TASK_CLASSES.get(spec.task_id)
-                        arm_timeout = (
-                            TASK_TIMEOUT
-                            if task_cls is not None and task_cls.difficulty == "简单"
-                            else TASK_TIMEOUT_MEDIUM_HIGH
-                        )
+                    arm_timeout = resolve_task_timeout(spec.task_id, args.timeout)
                     entry = run_arm(
                         spec,
                         arm,
