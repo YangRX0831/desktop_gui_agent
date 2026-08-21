@@ -1,20 +1,11 @@
 """在图像上标注调用方提供的 UI 元素。
 
-职责：
-    对 OCR 或其他感知模块已经提供的 UI 元素绘制编号、标签和类型颜色，
-    生成便于模型观察的 Pillow 图像；本模块自身不做目标检测或 OCR。
+本模块对 OCR 或其他感知组件已经提供的 UI 元素绘制编号、标签和类型颜色，
+生成便于模型观察的 Pillow 图像；自身不负责目标检测或 OCR。
 
-输入约束：
-    元素必须精确包含 text、bbox、element_type 三个字段。bbox 是完全位于
-    图像内的闭合绘制坐标，必须有正面积；未知字段和类型均拒绝。
-
-修改约束：
-    空元素序列返回原图，非空标注始终复制或转换图像，避免调用方持有的原始
-    截图被隐式修改。标签优先放在框上方，空间不足时移入图像范围。
-
-字体约束：
-    只尝试项目既有 Windows 字体候选；全部失败时明确报错，不临时下载字体
-    或增加依赖。候选字体路径失败只记录固定诊断信息。
+输入元素必须精确包含 ``text``、``bbox`` 和 ``element_type`` 三个字段。边界框
+必须完全位于图像内且具有正面积。非空标注始终基于当前图像副本绘制，避免修改
+调用方持有的原始截图。
 """
 
 import logging
@@ -44,8 +35,6 @@ class UIElement(TypedDict):
         text: 可显示的元素文字，空字符串表示仅编号。
         bbox: 完全位于图像内的整数矩形。
         element_type: text、button、input、icon 或 other。
-
-    ``annotate_ui_elements`` 按输入顺序编号并绘制该结构。
     """
 
     text: str
@@ -83,9 +72,8 @@ _LABEL_GAP = 2
 _LABEL_TEXT_COLOR = (255, 255, 255)
 _ELEMENT_FIELDS = {"text", "bbox", "element_type"}
 
-# PRD 4.5.2: 缓存重复出现的 UI 元素信息。模块级有界字典,保存已验证的
-# canonical element info(不是 rendered screenshot)。每次标注始终基于
-# 当前图像渲染,缓存仅节省重复输入的验证步骤。
+# 缓存已经验证的 UI 元素结构，仅减少重复参数校验；渲染始终使用当前图像，
+# 不缓存或复用旧截图的像素结果。
 _ELEMENT_CACHE: dict[tuple, tuple[dict[str, object], ...]] = {}
 _ELEMENT_CACHE_LIMIT = 64
 _STABILITY_DIFF_RATIO = 0.005
@@ -128,10 +116,7 @@ def frame_change_ratio(previous: Image.Image, current: Image.Image) -> float:
 
 
 def _validate_image(image: object) -> Image.Image:
-    """校验输入为有正尺寸的 Pillow 图像。
-
-    返回同一对象供后续函数保持清晰的收窄类型。
-    """
+    """校验输入为有正尺寸的 Pillow 图像并返回同一对象。"""
     if not isinstance(image, Image.Image):
         raise TypeError("image 必须是 Pillow Image")
     if image.width <= 0 or image.height <= 0:
@@ -143,10 +128,7 @@ def _validate_bbox(
     bbox: object,
     image: Image.Image,
 ) -> tuple[int, int, int, int]:
-    """校验绘制矩形形状、顺序、面积和图像边界。
-
-    Pillow 的矩形端点会参与绘制，因此右下角必须小于图像尺寸。
-    """
+    """校验绘制矩形的形状、顺序、面积和图像边界。"""
     if not isinstance(bbox, tuple):
         raise TypeError("bbox 必须是 tuple")
     if len(bbox) != 4:
@@ -163,10 +145,7 @@ def _validate_bbox(
 
 
 def _validate_element(element: object, image: Image.Image) -> UIElement:
-    """验证单个元素并返回类型收窄后的新字典。
-
-    精确字段集合拒绝上游意外泄漏的元数据进入标注流程。
-    """
+    """验证单个元素并返回类型收窄后的新字典。"""
     if not isinstance(element, dict):
         raise TypeError("elements 的每一项必须是 dict")
     if set(element) != _ELEMENT_FIELDS:
@@ -194,10 +173,7 @@ def _validate_elements(
     elements: object,
     image: Image.Image,
 ) -> list[UIElement]:
-    """验证元素容器并保持调用方给定的绘制顺序。
-
-    字符串虽满足 Sequence 协议但不是元素集合，因此显式排除。
-    """
+    """验证元素容器并保持调用方给定的绘制顺序。"""
     if isinstance(elements, (str, bytes, bytearray)) or not isinstance(
         elements,
         Sequence,
@@ -210,11 +186,7 @@ def _element_cache_key(
     image: Image.Image,
     elements: Sequence[UIElement],
 ) -> tuple | None:
-    """构建 element-info 缓存的确定性 key。
-
-    key 含 image.width/height 以确保 bounds 验证仍对当前图像有效。
-    输入不完整时返回 None(不缓存)。
-    """
+    """构建包含图像尺寸和元素内容的确定性缓存键。"""
     try:
         fingerprint = tuple(
             (e["text"], tuple(e["bbox"]), e["element_type"]) for e in elements
@@ -252,19 +224,15 @@ def _label_position(
     font: ImageFont.FreeTypeFont,
     image: Image.Image,
 ) -> tuple[float, float, float, float, float, float]:
-    """计算受图像边界约束的标签背景与文字位置。
-
-    标签优先位于元素上方，顶部空间不足时移入元素框；右侧和底部坐标
-    继续裁剪，避免小图像触发 Pillow 越界行为差异。
-    """
+    """计算受图像边界约束的标签背景与文字位置。"""
     text_bbox = draw.textbbox((0, 0), label, font=font)
     text_width = text_bbox[2] - text_bbox[0]
     text_height = text_bbox[3] - text_bbox[1]
     label_width = text_width + 2 * _LABEL_PADDING
     label_height = text_height + 2 * _LABEL_PADDING
 
-    # 标签优先绘制在元素上方；顶部空间不足时移入元素框内。同时限制
-    # 标签背景矩形的范围，避免其超出图像边界。
+    # 标签优先绘制在元素上方；顶部空间不足时移入元素框内，并限制背景矩形
+    # 仍处于图像范围内。
     x1, y1, _, _ = bbox
     label_x = min(x1, max(image.width - label_width, 0))
     preferred_y = y1 - _LABEL_GAP - label_height
@@ -283,10 +251,7 @@ def _draw_element(
     index: int,
     font: ImageFont.FreeTypeFont,
 ) -> None:
-    """用类型颜色绘制一个已验证元素及稳定编号标签。
-
-    本函数假设输入已验证，避免绘制过程中部分修改后才发现参数错误。
-    """
+    """用类型颜色绘制一个已验证元素及稳定编号标签。"""
     color = _ELEMENT_COLORS[element["element_type"]]
     draw.rectangle(element["bbox"], outline=color, width=_BORDER_WIDTH)
 
@@ -322,19 +287,15 @@ def annotate_ui_elements(
     """
     source_image = _validate_image(image)
 
-    # PRD 4.5.2: 缓存重复出现的 UI 元素 *信息*(验证后的 canonical element
-    # info),不是渲染结果图像。缓存命中时复用已验证元素,但标注始终基于
-    # 当前图像像素渲染,绝不返回旧帧底图。
     cache_key = _element_cache_key(source_image, elements)
     validated_elements: list[UIElement] | None = None
     if cache_key is not None and cache_key in _ELEMENT_CACHE:
-        # 命中:复用已验证的 canonical element info(深复制防污染)。
+        # 命中时复用已验证的元素结构副本，不复用历史图像。
         cached = cast(list[UIElement], _ELEMENT_CACHE[cache_key])
         validated_elements = cast(list[UIElement], [dict(e) for e in cached])
 
     if validated_elements is None:
         validated_elements = _validate_elements(elements, source_image)
-        # 缓存 canonical element info(独立副本,非图像)。
         if cache_key is not None and validated_elements:
             if len(_ELEMENT_CACHE) >= _ELEMENT_CACHE_LIMIT:
                 _ELEMENT_CACHE.clear()
@@ -343,7 +304,6 @@ def annotate_ui_elements(
     if not validated_elements:
         return source_image
 
-    # 每次调用始终基于当前图像副本渲染标注。
     result = (
         source_image.copy()
         if source_image.mode == "RGB"
