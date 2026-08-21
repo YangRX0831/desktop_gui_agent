@@ -1,21 +1,20 @@
-"""最终 API 15-task 系统测试的冻结结果 schema 与通用失败分类。
+"""定义 15 项系统测试的结果结构与通用失败分类。
 
-Schema 复用 paired_runner 既有字段,只补最终验收需要的顶层字段;
-失败分类为通用产品维度,禁止出现具体 case(如 S02/M03)专属类别。
+结果结构复用 ``paired_runner`` 已有字段，并补充模型调用、动作统计和
+证据路径等汇总信息。失败分类采用通用系统维度，不针对某个具体任务设置
+专属类别。
 
-既有字段映射(优先复用,不重写 runner):
+主要字段映射：
 
 - RUN_ID            <- ``pair_id``
 - TASK_ID/DIFFICULTY/TASK_TEXT <- ``case_spec`` 内 task_id/difficulty/instruction
-- MODE              <- ``arm`` + 本轮固定 API(单臂 acceptance)
+- MODE              <- ``arm`` 与模型运行模式
 - RESULT            <- ``status``
 - ELAPSED_SECONDS   <- ``elapsed_seconds``
 - FAILURE_CATEGORY  <- ``failure_reason`` 经 :func:`classify_failure_category`
 
-需最终 run 任务从 trace 产物补齐的增量字段:
-MODEL_CALL_COUNT / API_RETRY_COUNT / ACTION_COUNT / ERROR_COUNT /
-TRACE_PATH / EVIDENCE / NOTES(来源:GUI_AGENT_TRACE 输出与
-``agent_trace`` 逐步记录;runner 现未写为顶层字段)。
+模型调用次数、重试次数、动作次数、错误次数和证据路径等字段可由追踪记录
+进一步汇总补充。
 """
 
 from typing import Final
@@ -51,8 +50,7 @@ FAILURE_CATEGORIES: Final[tuple[str, ...]] = (
     "UNKNOWN",
 )
 
-# 通用关键词 -> 分类;按声明顺序首个命中生效。关键词是产品维度措辞,
-# 不含任何 benchmark case 专属标识。
+# 按声明顺序把常见失败原因关键词映射到通用系统分类。
 _CATEGORY_KEYWORDS: Final[tuple[tuple[str, tuple[str, ...]], ...]] = (
     ("ENVIRONMENT", ("env_error", "fixture", "环境准备失败", "桌面状态恢复失败")),
     ("TIMEOUT", ("timeout", "超时")),
@@ -67,10 +65,10 @@ _CATEGORY_KEYWORDS: Final[tuple[tuple[str, tuple[str, ...]], ...]] = (
 
 
 def classify_failure_category(failure_reason: str | None) -> str:
-    """把自由文本失败原因映射到通用失败分类;无法归类为 UNKNOWN。
+    """把自由文本失败原因映射到通用失败分类；无法归类时返回 UNKNOWN。
 
     Args:
-        failure_reason: runner/validator 记录的失败原因文本。
+        failure_reason: 测试执行器或验证器记录的失败原因文本。
 
     Returns:
         ``FAILURE_CATEGORIES`` 之一的分类字符串。
