@@ -13,7 +13,7 @@ Desktop GUI Agent 的目标是构建一个能够根据自然语言指令自主�
 ```text
 用户任务
   ↓
-CLI / 配置
+命令行入口 / 配置
   ↓
 GuiAgent
   ↓
@@ -40,8 +40,8 @@ GuiAgent
 |---|---|
 | `main.py` | 命令行入口、配置加载和组件初始化 |
 | `config.py` | 全局运行参数和模型配置 |
-| `agent/gui_agent.py` | Agent 主循环、恢复逻辑、完成判断和执行编排 |
-| `agent/model_client.py` | API / Local 模型统一调用接口 |
+| `agent/gui_agent.py` | 智能体主循环、恢复逻辑、完成判断和执行编排 |
+| `agent/model_client.py` | API 与本地模型统一调用接口 |
 | `agent/dashscope_api_backend.py` | DashScope API 调用 |
 | `agent/openvino_backend.py` | OpenVINO 本地模型推理 |
 | `agent/action_parser.py` | 动作语法解析和参数校验 |
@@ -54,7 +54,7 @@ GuiAgent
 
 ## 3. 动作协议设计
 
-项目最终采用八类模型动作：
+当前模型动作协议包含八类动作：
 
 ```text
 click
@@ -80,9 +80,11 @@ finish
 ```text
 Action: click(x=500, y=300)
 Action: type(text="Hello World")
-Action: hotkey(keys=["ctrl", "c"])
-Action: finish()
+Action: hotkey(key1="ctrl", key2="c")
+Action: finish(result="任务已完成")
 ```
+
+其中 `finish` 必须包含字符串形式的 `result` 参数，`hotkey` 按 `key1`、`key2` 等顺序命名按键参数。
 
 ### 3.2 动作规范化
 
@@ -104,7 +106,7 @@ click(x=875, y=963)
 
 上述转换只根据动作签名完成，不读取任务语义，也不根据截图猜测参数。规范化完成后仍需经过严格解析和安全检查。
 
-对于当前截图中已经明确编号的唯一元素，也支持将：
+对于当前截图中已经明确编号且能够唯一解析的元素，也支持将：
 
 ```text
 click(E1)
@@ -112,9 +114,9 @@ click(E1)
 
 确定性映射到对应元素边界框中心。
 
-## 4. Agent 执行流程
+## 4. 智能体执行流程
 
-一个 logical step 的主要过程为：
+一个逻辑步骤的主要过程为：
 
 1. 获取当前桌面截图和窗口状态；
 2. 运行 OCR 与视觉上下文构造；
@@ -127,16 +129,16 @@ click(E1)
 9. 判断是否取得进展；
 10. 判断任务是否完成。
 
-默认逻辑步数为 10，单步最多允许 3 次重试。
+默认基础逻辑步数为 10，单步默认最多允许 3 次重试。
 
 ### 4.1 有条件的步数扩展
 
-部分复杂任务在第 10 步附近仍可能保持有效推进，因此系统增加了有限的动态扩展机制。
+部分复杂任务在基础步数边界附近仍可能保持有效推进，因此系统提供有限的动态扩展机制。
 
 扩展规则如下：
 
 - 基础步数仍由 `max_steps` 决定，默认值为 10；
-- 最多额外增加 3 个 logical steps；
+- 最多额外增加 3 个逻辑步骤；
 - 每个任务最多触发一次；
 - 只有最近存在可测量的有效进展时才允许扩展；
 - 若存在重复动作、连续无进展、同策略重试耗尽或安全阻断，则不允许扩展。
@@ -164,24 +166,24 @@ click(E1)
 - 基于 `mss` 的桌面截图；
 - 基于 PaddleOCR 的界面文本识别；
 - 前台窗口和窗口列表获取；
-- ROI 截取；
+- 感兴趣区域截取；
 - OCR 与窗口信息的上下文整合。
 
 当前真实桌面场景下的性能测量为：
 
-| 指标 | Median | P95 |
+| 指标 | 中位数 | P95 |
 |---|---:|---:|
-| Screenshot | 57.88 ms | 62.17 ms |
+| 截图 | 57.88 ms | 62.17 ms |
 | OCR | 2345.60 ms | 2581.18 ms |
-| Total | 2437.33 ms | 2676.09 ms |
+| 总感知耗时 | 2437.33 ms | 2676.09 ms |
 
-由此可见，当前感知性能仍未达到 PRD 中 screenshot ≤50ms、OCR ≤200ms 和整体 perception ≤300ms 的要求。
+由此可见，当前感知性能仍未达到 PRD 中截图 ≤50ms、OCR ≤200ms 和整体感知 ≤300ms 的要求。
 
 ## 7. API 与本地模型
 
 ### 7.1 API 模式
 
-API 模式通过 DashScope OpenAI-compatible 接口完成视觉语言模型调用。
+API 模式通过 DashScope OpenAI 兼容接口完成视觉语言模型调用。
 
 核心配置包括：
 
@@ -194,35 +196,19 @@ DASHSCOPE_TIMEOUT_SECONDS
 
 API 模式已经完成完整桌面任务闭环验证。
 
-### 7.2 Local 模式
+### 7.2 本地模型模式
 
-本地模式支持：
+本地模式支持 Transformers 和 OpenVINO 两种运行时。
 
-- Transformers
-- OpenVINO
+本地模型能够完成模型加载、图像输入、动作输出、坐标转换和智能体主循环接入，但当前在真实桌面任务中的界面定位和任务规划能力仍不足，尚未达到至少 3 项简单任务端到端通过的目标。
 
-Local 模型能够完成模型加载、图像输入、动作输出、坐标转换和 Agent loop 接入，但当前在真实桌面任务中的 grounding 和任务规划能力仍不足，尚未达到至少 3 项 Simple 任务端到端通过的目标。
+模型目录通过环境变量配置并存放在仓库外部；Benchmark 不依赖开发机固定路径。
 
 ## 8. 诊断日志
 
-系统记录模型调用和动作执行的关键过程，包括：
+系统记录模型调用和动作执行的关键过程，包括运行编号、逻辑步骤与尝试次数、前台窗口信息、截图信息、OCR 与感知摘要、模型原始输出、规范化结果、动作解析结果、动作分发结果、模型延迟、进度判断、恢复信息、完成判断和步数扩展状态。
 
-- 任务与运行编号；
-- logical step 与 attempt；
-- 前台窗口信息；
-- screenshot 信息；
-- OCR / perception 摘要；
-- 模型原始输出；
-- 规范化后的输出；
-- 动作解析结果；
-- 动作分发结果；
-- 模型延迟；
-- 进度判断；
-- recovery 信息；
-- completion 判断；
-- step extension 状态。
-
-API 密钥等敏感凭据不得进入诊断日志。
+诊断内容可能包含任务文本、模型输出或截图，因此只应保存在本地受控目录。API 密钥、访问令牌、密码等凭据不得作为诊断字段传入；对外分享日志或截图前仍需人工检查并脱敏。
 
 ## 9. 测试体系
 
@@ -230,8 +216,8 @@ API 密钥等敏感凭据不得进入诊断日志。
 
 1. 单元测试、集成测试和回归测试；
 2. Benchmark 测试框架自检；
-3. 单任务 GUI targeted 测试；
-4. 15 项 GUI official acceptance。
+3. 单任务 GUI 定向测试；
+4. 15 项 GUI 正式验收测试。
 
 普通质量检查入口为：
 
@@ -243,36 +229,36 @@ python -B tools/run_checks.py --all --report
 
 最终代码质量检查结果：
 
-- Tests：934 passed
-- Benchmark self-tests：80 passed
-- mypy：PASS
-- Black：PASS
-- isort：PASS
-- flake8：PASS
-- `git diff --check`：PASS
+- 项目测试：934 项通过
+- Benchmark 自检：80 项通过
+- mypy：通过
+- Black：通过
+- isort：通过
+- flake8：通过
+- `git diff --check`：通过
 
 ## 10. 代码质量
 
 最终审计统计：
 
-- Production Python files：38
-- Production LOC：15,630
-- Public API docstrings：310/310
-- Public API type hints：310/310
-- Comments + docstrings：19.53%
+- 生产代码 Python 文件：38
+- 生产代码行数：15,630
+- 公共 API 文档字符串：310/310
+- 公共 API 类型标注：310/310
+- 注释与文档字符串占比：19.53%
 
-公共 API 文档字符串和类型标注均已覆盖。注释与 docstring 的物理行比例仍未达到 PRD 要求的 30%。
+公共 API 文档字符串和类型标注均已覆盖。注释与文档字符串的物理行比例仍未达到 PRD 要求的 30%。
 
 ## 11. 当前主要限制
 
 当前系统仍存在以下限制：
 
 1. 复杂任务总体成功率尚未达到 PRD 70% 要求；
-2. 本地模型尚未达到 3 项 Simple 任务端到端通过；
+2. 本地模型尚未达到至少 3 项简单任务端到端通过；
 3. OCR 和整体感知性能距离目标较大；
 4. API 仍存在少量超过 2 秒的成功调用；
 5. 注释覆盖率低于 30%；
 6. macOS、Linux 和远程 CI 缺少完整实机验证；
-7. 独立 UI recognition accuracy ≥85% 尚无充分证据。
+7. 独立界面识别准确率 ≥85% 尚无充分证据。
 
-上述问题不影响当前代码结构、测试体系和文档完整性，但仍属于后续优化方向。
+上述限制不会改变当前代码结构和已完成测试结果，但仍属于后续优化方向。
