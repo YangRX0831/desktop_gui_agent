@@ -1,27 +1,17 @@
-"""提供本地与 API 多模态后端之间的统一调用边界。
+"""提供本地模型与 DashScope API 后端之间的统一调用边界。
 
-职责:
-    向 Agent 暴露统一 ``generate`` 接口，并把本地后端、DashScope 后端及
-    有限 API transport retry 隔离在同一个责任边界内。
+``ModelClient`` 向智能体暴露统一的 ``generate`` 接口，并负责本地后端调用、
+API 调用、有限的 API 传输重试以及本地模型加载失败时的 API 回退。
 
-重试约束:
-    API 失败允许首次请求后的最多三次重试。调用方不得围绕本客户端再做
-    模型调用重试，否则实际网络请求会产生乘法放大。不可重试异常立即停止。
+API 首次请求失败后最多重试三次。调用方不应在模型客户端外再次叠加网络重试，
+以避免请求次数成倍放大。
 
-本地模型约束:
-    production 采用 PRD 3.3/4.3.1 规定的 Transformers + Qwen2-VL-2B-Instruct
-    + 4-bit 量化加载；模型权重位于仓库外，构造阶段只验证路径，权在首次
-    generate 延迟加载。历史 OpenVINO 实现已不再作为 production baseline。
+本地 Transformers 后端使用 Qwen2-VL-2B-Instruct 与 4-bit 量化，模型权重
+保存在仓库外并在首次生成时延迟加载。只有 ``LocalModelLoadError`` 可以触发
+PRD 规定的本地模型加载失败回退；推理失败和输出失败不会自动发送到远程 API。
 
-fallback 行为（PRD 4.3.1）:
-    PRD 4.3.1 规定 local 模式下模型加载失败时自动切换到 API 模式;本模块
-    据此在 ``LocalModelLoadError`` 时自动调用 API 后端,前提是构造时
-    ``fallback_enabled`` 为 True。触发范围仅限 ``LocalModelLoadError``,
-    不把任意本地推理异常扩大为 fallback trigger。
-
-隐私与异常:
-    图像和 prompt 仅传给显式选择的后端。日志只包含固定事件、异常类型和
-    安全代码位置，不记录原始输入、响应、异常正文或模型目录内容。
+日志只记录固定事件、异常类型和安全代码位置，不记录原始图像、提示词、模型
+响应、异常正文或模型目录内容。
 """
 
 import importlib
@@ -57,48 +47,36 @@ _MAX_NEW_TOKENS = 256
 class LocalModelLoadError(RuntimeError):
     """表示本地模型权重、processor 或 pipeline 加载失败。
 
-    PRD 4.3.1 的 model-load-failure -> API fallback capability 仅以此类异常
-    作为触发条件；本地推理失败不得归入此类。ModelClient 据此区分是否允许
-    进入批准的 API fallback。
+    该异常是本地模式允许切换到 API 后端的唯一错误类型；本地推理失败不属于
+    模型加载失败。
     """
 
 
 class LocalModelInferenceError(RuntimeError):
     """表示本地模型图像处理或推理失败。
 
-    该错误不属于 model-load 失败，因此不得触发 local->API fallback；
-    本地后端不自行重试，避免隐藏推理成本和重复工作。
+    该错误不会触发本地模式到 API 模式的自动回退，本地后端也不会自行重试。
     """
 
 
 class LocalModelOutputError(RuntimeError):
     """表示本地模型没有返回可用的非空文本。
 
-    该错误不能通过宽松 Parser 或字符串 salvage 恢复，也不触发 fallback。
+    该错误不会通过放宽解析规则恢复，也不会触发 API 回退。
     """
 
 
 class ModelBackend(Protocol):
-    """定义模型后端必须提供的最小同步接口。
-
-    production 实现为本地 Qwen 或 DashScope；fake 用于无外部副作用测试。
-    """
+    """定义模型后端必须提供的最小同步接口。"""
 
     def generate(self, image: Image.Image, prompt: str) -> str:
         """根据图像和提示词生成文本。"""
 
 
 class Qwen2VLLocalBackend:
-    """通过 Transformers + 4-bit 量化加载 Qwen2-VL-2B-Instruct。
+    """通过 Transformers 与 4-bit 量化加载 Qwen2-VL-2B-Instruct。
 
-    Attributes:
-        model_dir: 已验证的仓库外 Qwen2-VL-2B-Instruct 模型目录。
-        max_new_tokens: 单次生成的输出 token 上限。
-        model: 延迟加载的 Transformers 多模态生成模型。
-        processor: 延迟加载的 Transformers 多模态 processor。
-
-    production 通常构造一次再串行调用。模型保持延迟加载，构造阶段不读取
-    权重，也不触发 ``from_pretrained``。
+    模型和 processor 均采用延迟加载，构造阶段只保存并验证模型目录与生成参数。
     """
 
     def __init__(
@@ -115,7 +93,7 @@ class Qwen2VLLocalBackend:
 
         Raises:
             TypeError: 配置参数类型不合法。
-            ValueError: 配置值越界，或模型目录不存在/不是目录。
+            ValueError: 配置值越界，或模型目录不存在或不是目录。
         """
         if not isinstance(model_dir, (str, Path)):
             raise TypeError("model_dir 必须是 str 或 Path。")
@@ -145,7 +123,7 @@ class Qwen2VLLocalBackend:
         return json.loads(path.read_text(encoding="utf-8-sig"))
 
     def _validate_model_dir(self) -> None:
-        """核对模型目录含 Qwen2-VL 必要文件，不加载权重。"""
+        """核对模型目录包含 Qwen2-VL 所需的基本文件。"""
         config_path = self._model_dir / "config.json"
         if not config_path.is_file():
             raise ValueError("model_dir 缺少 config.json。")
@@ -155,7 +133,6 @@ class Qwen2VLLocalBackend:
             raise ValueError("model_dir config.json 无效。") from exception
         if not isinstance(config, dict):
             raise ValueError("model_dir config.json 结构无效。")
-        # 仅校验 model_type，不绑定特定 Transformers 版本字段集，保持最小必要。
         if config.get("model_type") != "qwen2_vl":
             raise ValueError("model_dir 不是 qwen2_vl 模型。")
         if not (self._model_dir / "preprocessor_config.json").is_file():
@@ -167,9 +144,7 @@ class Qwen2VLLocalBackend:
         """延迟加载 Transformers 模型、processor 与模块句柄。
 
         Raises:
-            LocalModelLoadError: 模型或 processor 加载失败。该异常类型被
-                ModelClient 识别为 PRD model-load-failure，是触发 fallback 的
-                唯一条件。
+            LocalModelLoadError: 模型、processor 或其依赖加载失败。
         """
         if self._model is not None and self._processor is not None:
             return self._model, self._processor, self._transformers_module
@@ -179,12 +154,8 @@ class Qwen2VLLocalBackend:
             auto_processor = getattr(transformers_module, "AutoProcessor")
             model_cls = getattr(transformers_module, "Qwen2VLForConditionalGeneration")
             bnb_config_cls = getattr(transformers_module, "BitsAndBytesConfig")
-            # PRD 4.3.1 4-bit 量化加载合同：BitsAndBytesConfig(load_in_4bit=True)
-            # 通过 bitsandbytes 把权重加载为 4-bit,降低显存占用。
-            # transformers 5.x 不再接受 load_in_4bit 直接参数,必须通过
-            # quantization_config 传递。local_files_only=True 防止缺文件时
-            # 隐式联网下载。config.json model_type=qwen2_vl、无 auto_map,
-            # 不需要 trust_remote_code。
+            # 使用 BitsAndBytesConfig(load_in_4bit=True) 配置 4-bit 权重量化。
+            # local_files_only=True 防止模型文件缺失时隐式联网下载。
             quantization_config = bnb_config_cls(load_in_4bit=True)
             processor = auto_processor.from_pretrained(
                 self._model_dir,
@@ -223,7 +194,7 @@ class Qwen2VLLocalBackend:
         image: Image.Image,
         prompt: str,
     ) -> object:
-        """把 PIL 图像与 prompt 转换为模型输入；失败归为推理错误。"""
+        """把 PIL 图像与提示词转换为模型输入。"""
         try:
             messages = [
                 {
@@ -299,11 +270,9 @@ class Qwen2VLLocalBackend:
         Raises:
             TypeError: image 或 prompt 类型不合法。
             ValueError: prompt 为空。
-            LocalModelLoadError: 本地模型加载失败（可触发批准的 API fallback）。
-            LocalModelInferenceError: 图像处理或推理失败（不触发 fallback）。
-            LocalModelOutputError: 模型未返回可用的非空文本（不触发 fallback）。
-
-        首次调用在需要时延迟加载本地模型 pipeline，后续调用复用。
+            LocalModelLoadError: 本地模型加载失败。
+            LocalModelInferenceError: 图像处理或推理失败。
+            LocalModelOutputError: 模型未返回可用的非空文本。
         """
         self._validate_generate_args(image, prompt)
         model, processor, _ = self._load_pipeline()
@@ -313,10 +282,9 @@ class Qwen2VLLocalBackend:
 
 @dataclass(frozen=True)
 class ModelCallOptions:
-    """一次模型调用的分层消息协议可选请求配置。
+    """保存一次模型调用可选的分层消息参数。
 
-    对应旧 ``call_extra`` 事实承担的三个可选透传字段;None 表示
-    不发送该字段(保持 V1 单消息合同)。
+    ``None`` 表示不发送对应字段。
     """
 
     system_prompt: str | None = None
@@ -325,18 +293,7 @@ class ModelCallOptions:
 
 
 class ModelClient:
-    """统一执行本地模型调用、API 回退和有限 API 重试。
-
-    Attributes:
-        local_backend: 首选的本地模型实现，仅在 local 模式调用。
-        api_backend: 显式 API 模式或 PRD 4.3.1 自动 fallback 时使用的实现。
-        fallback_enabled: 是否启用 PRD model-load-failure -> API capability。
-        max_api_retries: 首次 API 失败后的最多重试次数。
-
-    fallback 按 PRD 4.3.1 自动触发:local 模式下 ``LocalModelLoadError``
-    且 ``fallback_enabled`` 为 True 时,无需任何 run 级授权即切换到
-    API 后端;其余本地异常不触发 fallback。
-    """
+    """统一执行本地模型调用、API 回退和有限 API 重试。"""
 
     def __init__(
         self,
@@ -350,8 +307,8 @@ class ModelClient:
 
         Args:
             local_backend: 本地模型后端。
-            api_backend: 可选注入后端；省略时从环境创建通义千问后端。
-            fallback_enabled: 是否保留 PRD model-load-failure -> API capability。
+            api_backend: 可选 API 后端；省略时根据环境配置 DashScope 后端。
+            fallback_enabled: 是否允许本地模型加载失败时切换到 API。
             max_api_retries: 首次 API 调用失败后允许的重试次数。
 
         Raises:
@@ -410,7 +367,7 @@ class ModelClient:
         return response
 
     def _can_fallback(self, exception: Exception) -> bool:
-        """判断当前异常是否属于 PRD model-load-failure 且 capability 开启。"""
+        """判断异常是否属于允许切换到 API 的模型加载失败。"""
         if not isinstance(exception, LocalModelLoadError):
             return False
         return self._fallback_enabled
@@ -421,7 +378,7 @@ class ModelClient:
         prompt: str,
         options: ModelCallOptions | None = None,
     ) -> str:
-        """执行首次 API 调用和次数有限的失败后重试;透传消息协议参数。"""
+        """执行首次 API 调用和次数有限的失败后重试。"""
         options = options or ModelCallOptions()
         call_extra: dict[str, object] = {}
         if options.system_prompt is not None:
@@ -460,8 +417,7 @@ class ModelClient:
             image: 原样传给后端的 PIL 图像。
             prompt: 原样传给后端的非空提示词。
             mode: 首选调用模式。
-            options: 分层消息协议可选配置(system/temperature/usage);None 保持
-                V1 单消息合同。
+            options: 可选的 system prompt、temperature 和 usage 输出容器。
 
         Returns:
             模型后端文本，或固定且脱敏的运行错误信息。
@@ -470,9 +426,8 @@ class ModelClient:
             TypeError: 公共参数类型错误。
             ValueError: 参数值不合法。
 
-        local 模式下，仅当本地模型 *load* 失败且 ``fallback_enabled`` 为
-        True 时，按 PRD 4.3.1 自动把图像与 prompt 切换到远程 API；其余本地
-        失败一律返回固定本地失败信息，不发送任何远程数据。
+        local 模式只在本地模型加载失败且 ``fallback_enabled`` 为 True 时把图像
+        与提示词发送到 API；其它本地错误返回固定失败信息，不触发远程调用。
         """
         self._validate_generate_args(image, prompt, mode)
         if mode == "api":
