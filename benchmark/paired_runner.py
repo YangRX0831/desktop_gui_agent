@@ -1,16 +1,17 @@
-"""配对验证驱动:同一 CaseSpec 下 V1 vs CLEAN_V3 的逐 pair A/B 运行。
+"""配对基准测试入口，在同一 CaseSpec 下运行 V1 与 V3 对照。
 
-用法:
+用法：
     python -B benchmark/paired_runner.py --tasks S01,S03
 
-每个 pair 内两臂读取同一份 CaseSpec(同 instruction、同 initial state),
-S03 在每臂 prepare 时显式 reset 初始音量并读回确认。结果增量写入
-benchmark/reports/PAIRED_<ts>/paired_results.jsonl。
+每个配对实例的两种协议使用同一份 CaseSpec，包括相同的任务指令和初始
+状态。S03 会在每次运行前重置并确认初始音量。结果增量写入
+``benchmark/reports/PAIRED_<ts>/paired_results.jsonl``。
 """
 
 import argparse
 import json
 import logging
+import os
 import shutil
 import sys
 import time
@@ -49,14 +50,8 @@ TASK_CLASSES = {t.task_id: t for t in ALL_TASKS}
 
 
 def gen_pair_id() -> str:
+    """生成带时间戳的配对测试运行编号。"""
     return time.strftime("PAIRED_%Y%m%d_%H%M%S")
-
-
-LOCAL_MODEL_DIR = (
-    r"C:\AI\OpenVINO\Qwen2-VL-2B-Instruct-INT4"
-    r"\895c3a49bc3fa70a340399125c650a463535e71c"
-    r"-ov2026.2.1-oi1.26.0-nncf3.2.0-int4"
-)
 
 
 def run_arm(
@@ -69,10 +64,10 @@ def run_arm(
     timeout: float = TASK_TIMEOUT,
     fixture_ok: bool = True,
 ) -> dict:
-    """按 CaseSpec 运行一个 arm;返回逐 run 结果记录。
+    """按 CaseSpec 运行一个测试分支并返回结果记录。
 
-    HARNESS H2:依赖 WebFixture 的任务在 fixture 未启动时直接按
-    ENV_ERROR 分类,不创建会话、不注入指令、不计普通 Agent FAIL。
+    依赖 WebFixture 的任务在测试服务不可用时直接标记为 ``ENV_ERROR``，
+    不创建 Agent 会话，也不把环境故障计为普通任务失败。
     """
     if spec.task_id in FIXTURE_TASK_IDS and not fixture_ok:
         log.error("%s %s: fixture 未启动,标记 ENV_ERROR", spec.pair_id, arm)
@@ -93,9 +88,18 @@ def run_arm(
         env_overrides["GUI_AGENT_SEMANTIC_EXECUTION"] = "1"
     cli_args = None
     if local:
+        model_dir = os.environ.get("GUI_AGENT_OPENVINO_MODEL_DIR", "").strip()
+        if not model_dir:
+            log.error("local 模式缺少 GUI_AGENT_OPENVINO_MODEL_DIR")
+            return {
+                "pair_id": spec.pair_id,
+                "arm": "V1" if arm == "v1" else "CLEAN_V3",
+                "status": "ENV_ERROR",
+                "failure_reason": "missing_openvino_model_dir",
+            }
         env_overrides["GUI_AGENT_LOCAL_RUNTIME"] = "openvino"
-        env_overrides["GUI_AGENT_OPENVINO_MODEL_DIR"] = LOCAL_MODEL_DIR
-        # run_api.bat 已含 --model-mode api;argparse 后值覆盖 → local。
+        env_overrides["GUI_AGENT_OPENVINO_MODEL_DIR"] = model_dir
+        # Benchmark 默认使用 API 启动脚本；附加参数把本次会话切换为 local。
         cli_args = ["--model-mode", "local"]
     session = AgentSession(env_overrides=env_overrides)
     if not restore_benchmark_desktop_state(session.monitor):
@@ -125,9 +129,8 @@ def run_arm(
             str(shot / f"{spec.pair_id}_{arm}_before.png"),
         )
         task.terminal_hwnd = session.terminal_hwnd
-        # FIX A:统一经 task.instruction() 解析占位符(如
-        # GUIAgentBenchmark_CASE → 实际 desktop_dir 名);Agent 与
-        # TaskResult 都使用 resolved 版本,原始 CaseSpec 不变。
+        # instruction() 负责把工作区占位符解析为本次运行的实际目录；Agent 与
+        # TaskResult 使用同一份解析后指令，CaseSpec 本身保持不变。
         task.result.instruction = task.instruction()
         prepared = False
         try:
@@ -136,8 +139,7 @@ def run_arm(
             log.error("prepare 异常: %s", type(exception).__name__)
         if not prepared:
             if spec.task_id == "M06":
-                # 破坏性系统操作按设计不执行:SAFETY_SKIP 单列,不算
-                # 环境异常,不计入可执行任务分母,也不算 PASS。
+                # 破坏性系统操作按安全设计单列为 SAFETY_SKIP，不计为 PASS。
                 entry.update(
                     status="SAFETY_SKIP",
                     failure_reason="破坏性系统操作按安全设计跳过",
@@ -188,42 +190,43 @@ def run_arm(
 
 
 def main() -> None:
+    """解析命令行参数并执行所选配对测试。"""
     parser = argparse.ArgumentParser(description="Paired benchmark runner")
     parser.add_argument("--tasks", type=str, default="S01,S03")
     parser.add_argument(
         "--pair-count",
         type=int,
         default=None,
-        help="每个任务只运行前 N 个 pair(快速迭代预算控制;默认全部)",
+        help="每个任务只运行前 N 个 pair；默认运行全部。",
     )
     parser.add_argument(
         "--pair-ids",
         type=str,
         default=None,
-        help="只运行指定 pair(逗号分隔,如 S03_P02);覆盖 --pair-count",
+        help="只运行指定 pair（逗号分隔，如 S03_P02）；覆盖 --pair-count。",
     )
     parser.add_argument(
         "--arms",
         type=str,
         default="v1,v3",
-        help="运行的 arm(逗号分隔,如 v3;默认 v1,v3)",
+        help="运行的 arm（逗号分隔，如 v3；默认 v1,v3）。",
     )
     parser.add_argument(
         "--semantic",
         action="store_true",
-        help="启用 SEMANTIC EXECUTION PHASE 2A(GUI_AGENT_SEMANTIC_EXECUTION=1)",
+        help="启用程序化完成验证与进度状态（GUI_AGENT_SEMANTIC_EXECUTION=1）。",
     )
     parser.add_argument(
         "--preset",
         choices=["paired", "acceptance"],
         default="paired",
-        help="acceptance=PRD SIMPLE 固定六实例,V3+semantic 各跑一次",
+        help="acceptance 使用固定验收实例，并启用 V3 与语义验证。",
     )
     parser.add_argument("--timeout", type=float, default=TASK_TIMEOUT)
     parser.add_argument(
         "--local",
         action="store_true",
-        help="OpenVINO CPU 本地模式(LOCAL 2B BASELINE)",
+        help="使用 OpenVINO CPU 本地模式；模型目录从环境变量读取。",
     )
     args = parser.parse_args()
     task_ids = [t.strip().upper() for t in args.tasks.split(",")]
@@ -255,14 +258,14 @@ def main() -> None:
     if args.pair_ids:
         wanted = {p.strip().upper() for p in args.pair_ids.split(",")}
         specs = [s for s in specs if s.pair_id.upper() in wanted]
-    # 按命令行 --tasks 顺序执行(acceptance 单臂按需排序)。
+    # 保持与命令行 --tasks 一致的执行顺序。
     specs.sort(key=lambda s: task_ids.index(s.task_id) if s.task_id in task_ids else 99)
     arms = [a.strip().lower() for a in args.arms.split(",") if a.strip()]
     if args.preset == "acceptance":
         arms = ["v3"]
         args.semantic = True
 
-    # M02/M03/M05/H01 依赖本地 WebFixture(webmail/gallery/chat/article)。
+    # M02/M03/M05/H01 使用本地 WebFixture 提供隔离的测试数据。
     needs_fixture = any(s.task_id in FIXTURE_TASK_IDS for s in specs)
     fixture = WebFixture(port=18888)
     fixture_ok = True
@@ -282,7 +285,6 @@ def main() -> None:
             log.error("fixture 启动异常: %s", type(exception).__name__)
             fixture_ok = False
         if not fixture_ok:
-            # HARNESS H2:环境失败按 ENV_ERROR 分类,依赖任务不再执行。
             log.error("WebFixture 启动失败,依赖任务将标记 fixture_start_failed")
     try:
         with open(results_path, "w", encoding="utf-8") as out:
@@ -294,9 +296,7 @@ def main() -> None:
                         arm.upper(),
                         spec.instruction[:50],
                     )
-                    # HARNESS H5:未显式指定 --timeout 时按难度取统一
-                    # 常量:S 类 TASK_TIMEOUT,M/H 类 TASK_TIMEOUT_MEDIUM_HIGH
-                    # (与 runner.py 主线同源,不再对 M/H 写死 480s)。
+                    # 未显式指定超时时，简单任务和中高难度任务分别采用统一常量。
                     arm_timeout = args.timeout
                     if arm_timeout is None:
                         task_cls = TASK_CLASSES.get(spec.task_id)
@@ -330,8 +330,7 @@ def main() -> None:
             fixture.stop()
     shutil.rmtree(desktop_dir, ignore_errors=True)
     log.info("paired validation 完成: %s", results_path)
-    # 正式口径:PRD_TOTAL 15,M06 单列 SAFETY_SKIP;成功率分别按
-    # /15 与 /14 executable 输出,SKIP 不计作 PASS。
+    # 统计总任务数与可执行任务数；SAFETY_SKIP 不计为 PASS。
     entries = [json.loads(line) for line in open(results_path, encoding="utf-8")]
     passes = sum(1 for e in entries if e.get("status") == "PASS")
     skips = sum(1 for e in entries if e.get("status") == "SAFETY_SKIP")
