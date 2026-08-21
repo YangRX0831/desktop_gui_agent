@@ -1,7 +1,6 @@
-# Python bytecode and caches
+# Python 字节码、缓存和构建产物
 __pycache__/
 *.py[cod]
-*.pyc
 .mypy_cache/
 .pytest_cache/
 .ruff_cache/
@@ -11,19 +10,19 @@ build/
 dist/
 *.egg-info/
 
-# Runtime artifacts (logs, screenshots, model output)
+# 运行日志、截图和模型输出
 logs/
 *.log
 *.err
 
-# Environment and secrets
+# 本地环境与凭据
 .env
 .env.*
 *.key
 .venv/
 venv/
 
-# Local model weights and OCR/model caches (must live outside the repo)
+# 本地模型权重与模型缓存；模型文件应存放在仓库外
 *.bin
 *.safetensors
 *.onnx
@@ -31,14 +30,14 @@ venv/
 *.gguf
 model_cache/
 
-# Editor / OS
+# 编辑器与操作系统文件
 .vscode/
 .idea/
 *.swp
 .DS_Store
 Thumbs.db
 
-# Benchmark source is version-controlled; generated run artifacts stay local by default.
+# Benchmark 源码纳入版本控制；运行产物默认仅保存在本地。
 benchmark/reports/*
 !benchmark/reports/PAIRED_20260821_192024/
 benchmark/reports/PAIRED_20260821_192024/*
@@ -56,7 +55,7 @@ desktop_gui_agent_final_docs*.zip
 diagnostics_feature_plan.md
 周报_*.md
 
-# Local project-management and source requirement materials.
+# 本地项目管理材料和需求原文
 AGENTS.md
 项目进度与验收.md
 *.pdf
