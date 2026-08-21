@@ -1,0 +1,70 @@
+# Python bytecode and caches
+__pycache__/
+*.py[cod]
+*.pyc
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+build/
+dist/
+*.egg-info/
+
+# Runtime artifacts (logs, screenshots, model output)
+logs/
+*.log
+*.err
+
+# Environment and secrets
+.env
+.env.*
+*.key
+.venv/
+venv/
+
+# Local model weights and OCR/model caches (must live outside the repo)
+*.bin
+*.safetensors
+*.onnx
+*.engine
+*.gguf
+model_cache/
+
+# Editor / OS
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+
+# Acceptance harness source is version-controlled; only generated artifacts stay local.
+benchmark/reports/*
+!benchmark/reports/PAIRED_20260821_192024/
+benchmark/reports/PAIRED_20260821_192024/*
+!benchmark/reports/PAIRED_20260821_192024/paired_results.jsonl
+!benchmark/reports/PAIRED_20260821_224007/
+benchmark/reports/PAIRED_20260821_224007/*
+!benchmark/reports/PAIRED_20260821_224007/paired_results.jsonl
+benchmark/screenshots/
+benchmark/.tmp/
+benchmark/tmp/
+benchmark/**/*.jsonl
+benchmark/**/*_before.png
+benchmark/**/*_after.png
+!benchmark/reports/PAIRED_20260821_192024/paired_results.jsonl
+!benchmark/reports/PAIRED_20260821_224007/paired_results.jsonl
+reports/quality/*
+!reports/quality/quality_20260821_233957.json
+!reports/quality/quality_20260821_233957.md
+desktop_gui_agent_final_docs*.zip
+run_local.bat
+run_api.bat
+.zcode/
+diagnostics_feature_plan.md
+周报_*.md
+
+# Local governance and authority materials (never commit, per AGENTS.md 6.3)
+AGENTS.md
+项目进度与验收.md
+*.pdf

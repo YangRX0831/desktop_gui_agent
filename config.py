@@ -29,6 +29,19 @@ LocalRuntime = Literal["transformers", "openvino"]
 # PRD 4.4.1 默认步数上限 10;可通过 CLI --max-steps 调整。
 DEFAULT_MAX_STEPS = 10
 DEFAULT_RETRY_COUNT = 3
+# 决策协议 V2 feature flag:False=保持 V1 行为,True=启用 observe 动作、
+# V2 System Prompt、system/user 消息分层与 temperature=0 的实验协议。
+DECISION_PROTOCOL_V2_ENV = "GUI_AGENT_DECISION_PROTOCOL_V2"
+DECISION_PROTOCOL_V3_ENV = "GUI_AGENT_DECISION_PROTOCOL_V3"
+# benchmark/实验模式:任务 run 期间最小化 Agent 自身控制窗口,避免 CLI
+# 进入模型视野诱导模型点击自身界面;默认关闭,不改变正常用户模式行为。
+HIDE_OWN_WINDOW_ENV = "GUI_AGENT_HIDE_OWN_WINDOW_DURING_RUN"
+# SEMANTIC EXECUTION PHASE 2A:程序化 Completion Verifier + Minimal
+# Progress State。默认关闭;开启时 finish 需过三态程序验证,并注入
+# completion/progress 动态状态字段(不修改 V3 静态 Prompt)。
+SEMANTIC_EXECUTION_ENV = "GUI_AGENT_SEMANTIC_EXECUTION"
+# observe() 的固定等待秒数(程序决定,模型不可指定);允许范围 0.3-1.0。
+OBSERVE_WAIT_SECONDS = 0.6
 DEFAULT_LOG_LEVEL = "INFO"
 DEFAULT_LOG_DIR = Path("logs")
 LOCAL_MODEL_DIR_ENV = "GUI_AGENT_LOCAL_MODEL_DIR"
@@ -38,11 +51,24 @@ LOCAL_RUNTIME_ENV = "GUI_AGENT_LOCAL_RUNTIME"
 OPENVINO_MODEL_DIR_ENV = "GUI_AGENT_OPENVINO_MODEL_DIR"
 DEFAULT_LOCAL_RUNTIME: LocalRuntime = "transformers"
 COORDINATE_MODE_ENV = "GUI_AGENT_COORDINATE_MODE"
+TRACE_ENV = "GUI_AGENT_TRACE"
 DEFAULT_COORDINATE_MODE: CoordinateMode = "normalized_1000"
 MODEL_IMAGE_MAX_DIM_ENV = "GUI_AGENT_MODEL_IMAGE_MAX_DIM"
 # 模型输入图像长边上限(像素):超过时等比缩放。1280 兼顾 UI 细节与
 # visual token 数量;可通过环境变量调整,适配不同模型能力。
 DEFAULT_MODEL_IMAGE_MAX_DIM = 1280
+# local 模式专用长边上限(P5):2B 本地模型 visual token 随尺寸超线性
+# 增长,1280 时 warm 推理远超 PRD 3s 门槛;640 实测 warm 2.9s 达标,
+# 且 local compact 路线为键盘优先、对视觉细节依赖低。API 模式不受
+# 影响,仍用上面的 1280。
+LOCAL_MODEL_IMAGE_MAX_DIM_ENV = "GUI_AGENT_LOCAL_IMAGE_MAX_DIM"
+DEFAULT_LOCAL_MODEL_IMAGE_MAX_DIM = 640
+API_MODEL_ENV = "DASHSCOPE_API_MODEL"
+API_ENABLE_THINKING_ENV = "GUI_AGENT_API_ENABLE_THINKING"
+API_THINKING_BUDGET_ENV = "GUI_AGENT_API_THINKING_BUDGET"
+API_THINKING_OPTIONS_SUPPORTED_ENV = "GUI_AGENT_API_THINKING_OPTIONS_SUPPORTED"
+DEFAULT_API_ENABLE_THINKING = False
+DEFAULT_API_THINKING_OPTIONS_SUPPORTED = True
 
 
 @dataclass(frozen=True)
@@ -51,12 +77,16 @@ class AppConfig:
 
     Attributes:
         model_mode: 模型调用模式。
-        max_steps: 单任务最大执行轮次。
+        max_steps: 单任务基础 logical step 上限；符合推进条件时可有界扩展。
         log_level: 标准库日志级别。
         log_dir: 周期日志输出目录。
         retry_count: 已解析动作执行失败后的单步重试上限。
         local_model_dir: 可选的本地模型目录。
         coordinate_mode: 模型 click 坐标使用截图像素或 0..1000 相对坐标。
+        api_model: API 模型名称;None 表示未配置。
+        api_enable_thinking: thinking 三态覆盖;None 表示不发送该字段。
+        api_thinking_budget: 可选 thinking token budget。
+        api_thinking_options_supported: provider 是否支持 thinking 字段。
 
     CLI 使用 ``config_from_arguments`` 创建该对象，再交给 production wiring。
     """
@@ -70,6 +100,10 @@ class AppConfig:
     coordinate_mode: CoordinateMode = DEFAULT_COORDINATE_MODE
     local_runtime: LocalRuntime = DEFAULT_LOCAL_RUNTIME
     openvino_model_dir: Path | None = None
+    api_model: str | None = None
+    api_enable_thinking: bool | None = DEFAULT_API_ENABLE_THINKING
+    api_thinking_budget: int | None = None
+    api_thinking_options_supported: bool = DEFAULT_API_THINKING_OPTIONS_SUPPORTED
 
     def __post_init__(self) -> None:
         """验证配置，但不访问模型、网络或桌面。"""
@@ -101,6 +135,27 @@ class AppConfig:
             Path,
         ):
             raise TypeError("openvino_model_dir 必须是 pathlib.Path 或 None。")
+        if self.api_model is not None:
+            if not isinstance(self.api_model, str):
+                raise TypeError("api_model 必须是 str 或 None。")
+            if not self.api_model.strip():
+                raise ValueError("api_model 不得为空。")
+            object.__setattr__(self, "api_model", self.api_model.strip())
+        if (
+            self.api_enable_thinking is not None
+            and type(
+                self.api_enable_thinking,
+            )
+            is not bool
+        ):
+            raise TypeError("api_enable_thinking 必须是 bool 或 None。")
+        if self.api_thinking_budget is not None:
+            self._validate_positive_integer(
+                self.api_thinking_budget,
+                "api_thinking_budget",
+            )
+        if type(self.api_thinking_options_supported) is not bool:
+            raise TypeError("api_thinking_options_supported 必须是 bool。")
 
     @staticmethod
     def _validate_positive_integer(value: object, name: str) -> None:
@@ -129,6 +184,10 @@ class GuiAgentSettings:
     coordinate_mode: CoordinateMode = DEFAULT_COORDINATE_MODE
     reject_initial_finish: bool = True
     verify_action_effect: bool = True
+    decision_protocol_v2: bool = False
+    decision_protocol_v3: bool = False
+    hide_own_window_during_run: bool = False
+    semantic_execution: bool = False
 
     def __post_init__(self) -> None:
         """在 Agent 创建副作用依赖前验证全部设置。"""
@@ -140,8 +199,16 @@ class GuiAgentSettings:
             raise ValueError("coordinate_mode 不是受支持的坐标模式。")
         if type(self.reject_initial_finish) is not bool:
             raise TypeError("reject_initial_finish 必须是 bool。")
+        if type(self.decision_protocol_v2) is not bool:
+            raise TypeError("decision_protocol_v2 必须是 bool。")
+        if type(self.decision_protocol_v3) is not bool:
+            raise TypeError("decision_protocol_v3 必须是 bool。")
         if type(self.verify_action_effect) is not bool:
             raise TypeError("verify_action_effect 必须是 bool。")
+        if type(self.hide_own_window_during_run) is not bool:
+            raise TypeError("hide_own_window_during_run 必须是 bool。")
+        if type(self.semantic_execution) is not bool:
+            raise TypeError("semantic_execution 必须是 bool。")
 
 
 def local_model_dir_from_env() -> Path | None:
@@ -150,6 +217,24 @@ def local_model_dir_from_env() -> Path | None:
     if value is None or not value.strip():
         return None
     return Path(value)
+
+
+def local_model_image_max_dim_from_env() -> int:
+    """读取 local 模式图像长边上限;未配置时使用 640(P5 性能口径)。"""
+    value = os.environ.get(LOCAL_MODEL_IMAGE_MAX_DIM_ENV)
+    if value is None or not value.strip():
+        return DEFAULT_LOCAL_MODEL_IMAGE_MAX_DIM
+    try:
+        dim = int(value.strip())
+    except ValueError:
+        raise ValueError(
+            "GUI_AGENT_LOCAL_MODEL_IMAGE_MAX_DIM 必须是正整数。",
+        )
+    if dim < 256:
+        raise ValueError(
+            "GUI_AGENT_LOCAL_MODEL_IMAGE_MAX_DIM 不得低于 256。",
+        )
+    return dim
 
 
 def model_image_max_dim_from_env() -> int:
@@ -170,6 +255,59 @@ def model_image_max_dim_from_env() -> int:
     return dim
 
 
+def api_model_from_env() -> str | None:
+    """读取 API 模型名称;空值视为未配置。"""
+    value = os.environ.get(API_MODEL_ENV)
+    if value is None or not value.strip():
+        return None
+    return value.strip()
+
+
+def api_enable_thinking_from_env() -> bool | None:
+    """读取 thinking 三态覆盖;未设置保持当前产品默认关闭。"""
+    value = os.environ.get(API_ENABLE_THINKING_ENV)
+    if value is None:
+        return DEFAULT_API_ENABLE_THINKING
+    normalized = value.strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    if normalized in {"none", "default"}:
+        return None
+    raise ValueError(
+        "GUI_AGENT_API_ENABLE_THINKING 必须是 true、false 或 none。",
+    )
+
+
+def api_thinking_budget_from_env() -> int | None:
+    """读取可选 thinking budget;未设置或空值时不发送 override。"""
+    value = os.environ.get(API_THINKING_BUDGET_ENV)
+    if value is None or not value.strip():
+        return None
+    try:
+        budget = int(value.strip())
+    except ValueError:
+        raise ValueError("GUI_AGENT_API_THINKING_BUDGET 必须是正整数。")
+    AppConfig._validate_positive_integer(budget, "api_thinking_budget")
+    return budget
+
+
+def api_thinking_options_supported_from_env() -> bool:
+    """读取 provider thinking capability;默认使用当前 DashScope 能力。"""
+    value = os.environ.get(API_THINKING_OPTIONS_SUPPORTED_ENV)
+    if value is None:
+        return DEFAULT_API_THINKING_OPTIONS_SUPPORTED
+    normalized = value.strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError(
+        "GUI_AGENT_API_THINKING_OPTIONS_SUPPORTED 必须是 bool。",
+    )
+
+
 def local_runtime_from_env() -> LocalRuntime:
     """读取本地推理运行时;未配置时保持 transformers canonical 默认。"""
     value = os.environ.get(LOCAL_RUNTIME_ENV, DEFAULT_LOCAL_RUNTIME)
@@ -187,6 +325,45 @@ def openvino_model_dir_from_env() -> Path | None:
     if value is None or not value.strip():
         return None
     return Path(value)
+
+
+def decision_protocol_v2_from_env() -> bool:
+    """读取决策协议 V2 开关;默认 False(保持 V1 行为)。"""
+    value = os.environ.get(DECISION_PROTOCOL_V2_ENV, "")
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def decision_protocol_v3_from_env() -> bool:
+    """读取决策协议 V3 开关;未设置时默认 True(2026-08-19 起 CLEAN V3
+    为研发 baseline)。显式设为 0/false/no/off 回到 V1;与 V2 互斥,V3 优先。"""
+    value = os.environ.get(DECISION_PROTOCOL_V3_ENV)
+    if value is None:
+        return True
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def semantic_execution_from_env() -> bool | None:
+    """读取 SEMANTIC EXECUTION 开关;未设置返回 None 交给调用方解析。
+
+    未设置时随研发默认协议 CLEAN V3 一同启用(2026-08-19 pre-acceptance
+    起);显式 0/false/no/off 关闭;显式选择 V1/V2 时保持旧行为不启用。
+    """
+    value = os.environ.get(SEMANTIC_EXECUTION_ENV)
+    if value is None:
+        return None
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def hide_own_window_during_run_from_env() -> bool:
+    """读取 run 期间最小化自身控制窗口开关;默认 False。"""
+    value = os.environ.get(HIDE_OWN_WINDOW_ENV, "")
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def trace_enabled_from_env() -> bool:
+    """读取 debug/benchmark 模式的 agent trace 开关;默认关闭。"""
+    value = os.environ.get(TRACE_ENV, "")
+    return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
 def coordinate_mode_from_env() -> CoordinateMode:

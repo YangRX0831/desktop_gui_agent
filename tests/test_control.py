@@ -630,6 +630,40 @@ def test_keyboard_type_enter_uses_named_key(monkeypatch: pytest.MonkeyPatch) -> 
     assert ("press", "ENTER") in keyboard.events
 
 
+def test_keyboard_type_preserves_structured_text_action_order(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """结构化文本按原顺序执行字符、Tab、Enter 和最终提交 Tab。"""
+    controller, _ = _make_keyboard(monkeypatch)
+    monkeypatch.setattr(
+        controller,
+        "_keys",
+        SimpleNamespace(tab="TAB", enter="ENTER"),
+    )
+    events: list[tuple[str, object]] = []
+    monkeypatch.setattr(
+        controller,
+        "_execute_windows_text_action",
+        lambda units, index, total: events.append(("text", chr(units[0]))),
+    )
+    monkeypatch.setattr(
+        controller,
+        "_execute_keyboard_type_action",
+        lambda key, index, total: events.append(("key", key)),
+    )
+
+    controller.type("a\tb\nc\t")
+
+    assert events == [
+        ("text", "a"),
+        ("key", "TAB"),
+        ("text", "b"),
+        ("key", "ENTER"),
+        ("text", "c"),
+        ("key", "TAB"),
+    ]
+
+
 def test_keyboard_type_surrogate_rejected(monkeypatch: pytest.MonkeyPatch) -> None:
     """type 中孤立 UTF-16 代理项被拒绝。"""
     controller, keyboard = _make_keyboard(monkeypatch)

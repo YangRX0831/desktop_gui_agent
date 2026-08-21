@@ -1,0 +1,180 @@
+# Desktop GUI Agent 最终测试报告
+
+## 1. 测试目的
+
+本次测试主要验证项目的代码质量、基础功能、桌面任务执行能力、模型调用性能、本地模型支持情况和环境感知性能。
+
+测试包括代码级自动化测试和真实 GUI 任务测试两部分。
+
+## 2. 代码质量测试
+
+最终代码质量检查结果如下：
+
+| 项目 | 结果 |
+|---|---|
+| `pytest tests/` | 934 passed |
+| Benchmark self-tests | 80 passed |
+| mypy | PASS |
+| Black | PASS |
+| isort | PASS |
+| flake8 | PASS |
+| `git diff --check` | PASS |
+
+代码审计统计：
+
+| 指标 | 结果 |
+|---|---:|
+| Production Python files | 38 |
+| Production LOC | 15,630 |
+| Public API docstrings | 310 / 310 |
+| Public API type hints | 310 / 310 |
+| Comment-only lines | 2.65% |
+| Comments + docstrings | 19.53% |
+
+公共 API 文档字符串和类型标注已经全部覆盖，但注释与 docstring 的综合比例仍低于 PRD 要求的 30%。
+
+## 3. GUI 正式测试任务
+
+正式测试集共 15 项：
+
+### Simple
+
+- S01：Calculator 1+1
+- S02：Notepad 输入 Hello World
+- S03：调整系统音量
+- S04：打开 Chrome
+- S05：搜索 Python
+- S06：关闭当前窗口
+
+### Medium
+
+- M01：Excel 输入三行数据
+- M02：发送简单邮件
+- M03：下载图片到 Desktop
+- M04：打开并读取本地文档
+- M05：发送聊天消息
+- M06：清空回收站
+
+### Complex
+
+- H01：网页文本复制到 Word
+- H02：创建 PowerPoint 标题和正文
+- H03：查找并打开文件
+
+M06 涉及破坏性系统操作，按照当前安全策略标记为 `SAFETY_SKIP`，计 0 分，但总任务数仍按 15 项计算。
+
+## 4. 主要正式测试结果
+
+### 4.1 可比基准运行
+
+运行编号：
+
+```text
+PAIRED_20260821_192024
+```
+
+结果：
+
+| Task | Result |
+|---|---|
+| S01 | FAIL |
+| S02 | PASS |
+| S03 | PASS |
+| S04 | PASS |
+| S05 | PASS |
+| S06 | PASS |
+| M01 | PASS |
+| M02 | PASS |
+| M03 | FAIL |
+| M04 | PASS |
+| M05 | PASS |
+| M06 | SAFETY_SKIP |
+| H01 | FAIL |
+| H02 | FAIL |
+| H03 | PASS |
+
+统计结果：
+
+| 难度 | 通过数 | 总数 |
+|---|---:|---:|
+| Simple | 5 | 6 |
+| Medium | 4 | 6 |
+| Complex | 1 | 3 |
+| Overall | 10 | 15 |
+
+Simple 成功率为 83.3%，达到 PRD 要求的 80%。
+
+Overall 成功率为 66.7%，低于 PRD 要求的 70%。
+
+## 5. API 调用性能
+
+可比正式运行中，95 次成功 API 调用的延迟如下：
+
+| 指标 | 延迟 |
+|---|---:|
+| Minimum | 717 ms |
+| Median | 1092 ms |
+| P95 | 1926 ms |
+| Maximum | 8329 ms |
+| >2s | 5 次 |
+
+由于存在成功调用超过 2 秒，因此 API inference ≤2s 指标未达到。
+
+## 6. 环境感知性能
+
+最新真实桌面场景测量：
+
+| 指标 | Median | P95 |
+|---|---:|---:|
+| Screenshot | 57.88 ms | 62.17 ms |
+| OCR | 2345.60 ms | 2581.18 ms |
+| Total | 2437.33 ms | 2676.09 ms |
+
+对应 PRD 指标：
+
+- Screenshot ≤50ms：未达到；
+- OCR ≤200ms：未达到；
+- Perception ≤300ms：未达到。
+
+## 7. 本地模型测试
+
+本地模型后端已经能够正常完成：
+
+- 模型加载；
+- 图像输入；
+- 模型推理；
+- 动作解析；
+- 坐标转换；
+- Agent loop 接入。
+
+但在最终本地 Simple E2E 测试中，尚未取得有效通过任务，因此本地模型的主要问题仍集中在界面 grounding 和任务规划能力。
+
+## 8. 结果汇总
+
+### 已达到
+
+- Simple task success rate ≥80%
+- API / Local 双模式程序入口
+- Canonical 八动作协议
+- 严格动作解析与安全检查
+- 单元测试与 Benchmark self-tests
+- mypy / Black / isort / flake8
+- 公共 API docstring 与类型标注
+- 模型诊断日志
+- 技术文档、使用说明和部署说明
+
+### 尚未达到
+
+- Overall task success rate ≥70%
+- Local ≥3 Simple E2E
+- Perception ≤300ms
+- API inference ≤2s
+- Comment coverage ≥30%
+- Demo video
+- macOS / Linux 实机验证
+- Remote CI 成功证据
+- Independent UI recognition accuracy ≥85% 的充分证据
+
+## 9. 结论
+
+项目已经形成完整的桌面智能体工程结构，具备从环境感知、模型推理、动作执行到失败恢复和诊断记录的完整链路。代码质量与 Simple 任务成功率达到主要阶段目标，但复杂任务稳定性、本地模型能力和感知性能仍有明显优化空间。

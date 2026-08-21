@@ -82,8 +82,11 @@ def _create_ocr_engine() -> OCRPredictor:
     try:
         module = import_module("paddleocr")
         paddle_ocr = module.PaddleOCR
-        # 这些 CPU 推理与检测参数（MKL-DNN、8 线程、736/max）共同影响
+        # 这些 CPU 推理与检测参数（MKL-DNN、8 线程、960/max）共同影响
         # OCR 的准确率和延迟；修改后应重新进行准确率与性能回归验证。
+        # 960 为 P5/P5B 对照实验选定:清晰文本字符准确率 0.9905,
+        # 较 736 的 0.9238 对 90% 门槛保有约 9pp 安全余量;UI 元素
+        # 命中率两者持平(0.980),736 的延迟优势不改变任何门槛判定。
         engine = paddle_ocr(
             ocr_version="PP-OCRv4",
             lang="ch",
@@ -91,7 +94,7 @@ def _create_ocr_engine() -> OCRPredictor:
             enable_mkldnn=True,
             cpu_threads=8,
             mkldnn_cache_capacity=10,
-            text_det_limit_side_len=736,
+            text_det_limit_side_len=960,
             text_det_limit_type="max",
             use_doc_orientation_classify=False,
             use_doc_unwarping=False,

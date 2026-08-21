@@ -25,8 +25,9 @@ import os
 import threading
 from collections import deque
 from collections.abc import Callable, Sequence
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Protocol
+from typing import Protocol, cast
 
 from agentscope.message import Msg
 
@@ -36,16 +37,26 @@ from config import (
     DEFAULT_RETRY_COUNT,
     AppConfig,
     GuiAgentSettings,
+    api_enable_thinking_from_env,
+    api_model_from_env,
+    api_thinking_budget_from_env,
+    api_thinking_options_supported_from_env,
     coordinate_mode_from_env,
+    decision_protocol_v2_from_env,
+    decision_protocol_v3_from_env,
+    hide_own_window_during_run_from_env,
     local_model_dir_from_env,
     local_runtime_from_env,
     openvino_model_dir_from_env,
+    semantic_execution_from_env,
+    trace_enabled_from_env,
 )
 from perception.screenshot import (
     activate_window,
     get_foreground_app_hwnd,
     get_window_process_name,
     is_window_existing,
+    list_visible_windows_zorder,
     minimize_window,
 )
 from utils.logger import setup_logging
@@ -79,7 +90,22 @@ ActionObserver = Callable[[int, ParsedAction], None]
 
 # 相对指代词表:命中时 CLI 从前台时间线解析任务目标窗口。这是通用
 # 语言指代解析,不是应用名或任务答案硬编码。
-_RELATIVE_REFERENCE_KEYWORDS = ("当前窗口", "当前应用")
+_RELATIVE_REFERENCE_KEYWORDS = (
+    "当前窗口",
+    "当前应用",
+    "当前浏览器",
+    "当前网页",
+)
+_BROWSER_PROCESS_NAMES = frozenset(
+    {"chrome.exe", "msedge.exe", "firefox.exe", "brave.exe", "opera.exe"}
+)
+
+
+def _has_relative_window_reference(task: str) -> bool:
+    """判断任务是否以相对指代引用提交前的业务窗口。"""
+    if any(keyword in task for keyword in _RELATIVE_REFERENCE_KEYWORDS):
+        return True
+    return "窗口" in task and any(marker in task for marker in ("这个", "那个", "该"))
 
 
 def start_foreground_timeline() -> tuple[deque, threading.Event]:
@@ -106,12 +132,30 @@ def start_foreground_timeline() -> tuple[deque, threading.Event]:
     return timeline, stop
 
 
-def resolve_task_target_window(timeline: deque) -> dict[str, object] | None:
-    """回溯时间线中最近一个非当前前台的仍存在窗口作为任务目标。"""
+def resolve_task_target_window(
+    timeline: deque,
+    required_processes: frozenset[str] | None = None,
+) -> dict[str, object] | None:
+    """按可选进程类别回溯最近业务窗口；类别缺失时查最上层可见窗口。"""
     current_fg = get_foreground_app_hwnd()
     for hwnd, process in reversed(list(timeline)):
-        if hwnd != current_fg and is_window_existing(hwnd):
+        process_name = str(process).lower()
+        if (
+            hwnd != current_fg
+            and is_window_existing(hwnd)
+            and (required_processes is None or process_name in required_processes)
+        ):
             return {"hwnd": hwnd, "process": process}
+    if required_processes is not None:
+        for window in list_visible_windows_zorder():
+            hwnd = int(cast(int, window["hwnd"]))
+            process = str(window.get("process") or "")
+            if (
+                hwnd != current_fg
+                and process.lower() in required_processes
+                and is_window_existing(hwnd)
+            ):
+                return {"hwnd": hwnd, "process": process}
     return None
 
 
@@ -146,7 +190,7 @@ def create_argument_parser() -> argparse.ArgumentParser:
     Returns:
         包含模型模式、最大步数、格式重试和日志选项的参数解析器。
     """
-    parser = argparse.ArgumentParser(description="Desktop GUI Agent W3 demo")
+    parser = argparse.ArgumentParser(description="Desktop GUI Agent")
     parser.add_argument(
         "--model-mode",
         choices=("local", "api"),
@@ -157,7 +201,10 @@ def create_argument_parser() -> argparse.ArgumentParser:
         "--max-steps",
         type=int,
         default=DEFAULT_MAX_STEPS,
-        help=f"单任务最大模型轮次。默认：{DEFAULT_MAX_STEPS}。",
+        help=(
+            f"单任务基础 logical step 上限；满足可测推进条件时最多扩展 3 步。"
+            f"默认：{DEFAULT_MAX_STEPS}。"
+        ),
     )
     parser.add_argument(
         "--retry-count",
@@ -202,6 +249,10 @@ def config_from_arguments(arguments: argparse.Namespace) -> AppConfig:
         coordinate_mode=coordinate_mode_from_env(),
         local_runtime=local_runtime_from_env(),
         openvino_model_dir=openvino_model_dir_from_env(),
+        api_model=api_model_from_env(),
+        api_enable_thinking=api_enable_thinking_from_env(),
+        api_thinking_budget=api_thinking_budget_from_env(),
+        api_thinking_options_supported=api_thinking_options_supported_from_env(),
     )
 
 
@@ -223,10 +274,19 @@ def build_production_agent(
     """
     from agent.action_dispatcher import ActionDispatcher
     from agent.dashscope_api_backend import DashScopeAPIBackend
+    from agent.diagnostics import ActionDiagnosticsWriter
     from agent.gui_agent import GuiAgent, GuiAgentDependencies
     from agent.model_client import ModelBackend, ModelClient, Qwen2VLLocalBackend
     from control.keyboard_controller import KeyboardController
     from control.mouse_controller import MouseController
+
+    # SEMANTIC EXECUTION 默认策略(2026-08-19 pre-acceptance):未显式
+    # 设置时随研发默认协议 CLEAN V3 启用;显式 V1/V2 保持旧行为不启用;
+    # 任何显式设置(含 =0)按用户选择生效。
+    protocol_v3 = decision_protocol_v3_from_env()
+    semantic_execution = semantic_execution_from_env()
+    if semantic_execution is None:
+        semantic_execution = protocol_v3
 
     local_backend: ModelBackend
     if config.model_mode == "local" and config.local_runtime == "openvino":
@@ -242,7 +302,12 @@ def build_production_agent(
     else:
         local_backend = _UnavailableLocalBackend()
 
-    api_backend = DashScopeAPIBackend.from_env()
+    api_backend = DashScopeAPIBackend.from_env(
+        model=config.api_model,
+        enable_thinking=config.api_enable_thinking,
+        thinking_budget=config.api_thinking_budget,
+        supports_thinking_options=config.api_thinking_options_supported,
+    )
     # fallback_enabled 表示保留 PRD model-load-failure -> API capability;
     # 真正的远程发送授权由每个 run 显式设置(run-scoped, non-persistent)。
     model_client = ModelClient(local_backend, api_backend, fallback_enabled=True)
@@ -255,18 +320,29 @@ def build_production_agent(
     )
     from perception.ocr_recognizer import OCRRecognizer
 
+    trace_writer = None
+    if trace_enabled_from_env():
+        from agent.agent_trace import AgentTraceWriter
+
+        trace_writer = AgentTraceWriter(config.log_dir)
     dependencies = GuiAgentDependencies(
         model_client=model_client,
         action_dispatcher=dispatcher,
         action_observer=action_observer,
         protect_initial_foreground=True,
         ocr_recognizer=OCRRecognizer(),
+        diagnostics_writer=ActionDiagnosticsWriter(config.log_dir),
+        trace_writer=trace_writer,
     )
     settings = GuiAgentSettings(
         max_steps=config.max_steps,
         retry_count=config.retry_count,
         model_mode=config.model_mode,
         coordinate_mode=config.coordinate_mode,
+        decision_protocol_v2=decision_protocol_v2_from_env(),
+        decision_protocol_v3=protocol_v3,
+        hide_own_window_during_run=hide_own_window_during_run_from_env(),
+        semantic_execution=semantic_execution,
     )
     return GuiAgent(dependencies, settings)
 
@@ -303,13 +379,15 @@ async def run_cli(
     _clear_screen()
     write_output(WELCOME_MESSAGE)
     write_output(EXIT_INSTRUCTION)
+    # 就绪信号:初始化(含 OCR 预加载)全部完成后发出,供外部测试平台
+    # 判定 CLI 可接收指令,避免盲目等待固定时长。
+    logging.getLogger(__name__).info("cli_ready")
     timeline, stop_watcher = start_foreground_timeline()
     try:
         return await _cli_loop(
             config,
             agent_factory,
-            read_input,
-            write_output,
+            _CliIO(read_input, write_output),
             timeline,
             agent,
         )
@@ -317,41 +395,73 @@ async def run_cli(
         stop_watcher.set()
 
 
+@dataclass(frozen=True)
+class _CliIO:
+    """CLI 控制台 IO 接缝:输入读取与文本输出成对注入(测试假桩同源)。"""
+
+    read_input: Callable[[str], str]
+    write_output: Callable[[str], None]
+
+
 async def _cli_loop(
     config: AppConfig,
     agent_factory: _AgentFactory,
-    read_input: Callable[[str], str],
-    write_output: Callable[[str], None],
+    console: _CliIO,
     timeline: deque,
     agent: _Agent | None = None,
 ) -> int:
     """运行指令输入循环;含相对指代时解析目标窗口并管理CLI前后台。"""
     while True:
         try:
-            task = read_input("请输入指令：")
+            task = console.read_input("请输入指令：")
         except EOFError:
             task = "exit"
         if task.strip().lower() == "exit":
-            write_output(EXIT_MESSAGE)
+            console.write_output(EXIT_MESSAGE)
             return 0
         if not task.strip():
-            write_output("任务不能为空。")
+            console.write_output("任务不能为空。")
             continue
         if agent is None:
-            agent = agent_factory(config, _action_observer(write_output))
+            agent = agent_factory(
+                config,
+                _action_observer(console.write_output),
+            )
         logging.getLogger(__name__).info("cli_task_received")
-        metadata: dict[str, object] | None = None
+        trace_task_id = os.environ.get("GUI_AGENT_TRACE_TASK_ID", "").strip()
+        metadata: dict[str, object] | None = (
+            {"trace_task_id": trace_task_id} if trace_task_id else None
+        )
         agent_ui_hwnd = get_foreground_app_hwnd()
-        if any(keyword in task for keyword in _RELATIVE_REFERENCE_KEYWORDS):
-            target = resolve_task_target_window(timeline)
+        if _has_relative_window_reference(task):
+            required_processes = (
+                _BROWSER_PROCESS_NAMES
+                if "当前浏览器" in task or "当前网页" in task
+                else None
+            )
+            target = resolve_task_target_window(timeline, required_processes)
             if target is not None:
-                metadata = {"task_target_window": target}
+                if metadata is None:
+                    metadata = {}
+                metadata.update(
+                    {
+                        "task_target_window": target,
+                        "agent_ui_window_hwnd": agent_ui_hwnd,
+                    },
+                )
                 # 提交含相对指代任务时,最小化CLI并恢复目标窗口到前台,
                 # 避免CLI遮挡截图与目标歧义;失败均容忍。
                 minimize_window(agent_ui_hwnd)
-                activate_window(int(target["hwnd"]))
+                activate_window(int(cast(int, target["hwnd"])))
         try:
-            result = await agent(Msg("user", task, "user", metadata=metadata))
+            result = await agent(
+                Msg(
+                    "user",
+                    task,
+                    "user",
+                    metadata=metadata,  # type: ignore[arg-type]  # AgentScope JSON 类型
+                ),
+            )
         finally:
             if metadata is not None:
                 activate_window(agent_ui_hwnd)
@@ -360,12 +470,12 @@ async def _cli_loop(
         ):
             # result.content 已由 GuiAgent 格式化为 "任务执行失败：<reason>",
             # 直接输出避免重复前缀;PRD 4.4.2 只给出 success literal。
-            write_output(result.content)
+            console.write_output(result.content)
         else:
-            write_output(f"任务执行成功：{result.content}")
+            console.write_output(f"任务执行成功：{result.content}")
         statistics = _format_statistics(getattr(result, "metadata", None))
         if statistics:
-            write_output(statistics)
+            console.write_output(statistics)
 
 
 def _clear_screen() -> None:
@@ -410,38 +520,37 @@ def _action_observer(
 def _format_action(action: ParsedAction) -> str:
     """把已验证动作还原为 CLI 可读格式，不用于业务日志。
 
-    必须显式覆盖全部八种动作，未知动作类型显式抛 ValueError；新增动作
+    必须显式覆盖全部动作类型，未知动作类型显式抛 ValueError；新增动作
     类型时同步补齐分支，防止静默落到错误的参数访问。
     """
-    action_type = action["action_type"]
-    params = action["params"]
-    if action_type == "click":
-        return f"click(x={params['x']}, y={params['y']})"
-    if action_type == "right_click":
-        return f"right_click(x={params['x']}, y={params['y']})"
-    if action_type == "double_click":
-        return f"double_click(x={params['x']}, y={params['y']})"
-    if action_type == "drag":
+    if action["action_type"] == "click":
+        return f"click(x={action['params']['x']}, y={action['params']['y']})"
+    if action["action_type"] == "right_click":
+        return f"right_click(x={action['params']['x']}, y={action['params']['y']})"
+    if action["action_type"] == "double_click":
+        return f"double_click(x={action['params']['x']}, y={action['params']['y']})"
+    if action["action_type"] == "drag":
         return (
-            f"drag(x1={params['x1']}, y1={params['y1']}, "
-            f"x2={params['x2']}, y2={params['y2']})"
+            f"drag(x1={action['params']['x1']}, y1={action['params']['y1']}, "
+            f"x2={action['params']['x2']}, y2={action['params']['y2']})"
         )
-    if action_type == "type":
-        text = json.dumps(params["text"], ensure_ascii=False)
+    if action["action_type"] == "type":
+        text = json.dumps(action["params"]["text"], ensure_ascii=False)
         return f"type(text={text})"
-    if action_type == "scroll":
-        direction = json.dumps(params["direction"], ensure_ascii=False)
-        return f"scroll(direction={direction}, steps={params['steps']})"
-    if action_type == "hotkey":
+    if action["action_type"] == "scroll":
+        direction = json.dumps(action["params"]["direction"], ensure_ascii=False)
+        steps = action["params"]["steps"]
+        return f"scroll(direction={direction}, steps={steps})"
+    if action["action_type"] == "hotkey":
         items = ", ".join(
             f"key{index}={json.dumps(key, ensure_ascii=False)}"
-            for index, key in enumerate(params["keys"], start=1)
+            for index, key in enumerate(action["params"]["keys"], start=1)
         )
         return f"hotkey({items})"
-    if action_type == "finish":
-        result = json.dumps(params["result"], ensure_ascii=False)
+    if action["action_type"] == "finish":
+        result = json.dumps(action["params"]["result"], ensure_ascii=False)
         return f"finish(result={result})"
-    raise ValueError(f"不支持的动作类型：{action_type}")
+    raise ValueError(f"不支持的动作类型：{action['action_type']}")
 
 
 def main(argv: Sequence[str] | None = None) -> int:

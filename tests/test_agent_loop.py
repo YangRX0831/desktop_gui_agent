@@ -1,8 +1,13 @@
 """Agent 主循环、重试与效果验证测试。"""
 
 import asyncio
+from typing import TYPE_CHECKING
 
 import pytest
+
+if TYPE_CHECKING:
+    from agent.diagnostics import DiagnosticsRecord
+
 from agentscope.message import Msg
 from PIL import Image
 
@@ -234,82 +239,66 @@ def test_task_manager_no_duplicate_retry_accounting() -> None:
     assert "changed" not in manager.state.steps[0].action
 
 
-def test_unauthorized_load_failure_zero_remote_calls() -> None:
-    """未授权时 local load 失败不发起任何远程 API 调用。"""
+def test_load_failure_automatic_fallback_without_authorization() -> None:
+    """PRD 4.3.1:load 失败无需任何授权即自动切换 API(F2)。"""
     local = RecordingBackend(raise_exc=LocalModelLoadError("load"))
     api = RecordingBackend(response="x")
-    client = _make_client(local, api, authorized=False)
-    assert client.generate(Image.new("RGB", (1, 1)), "p") == "本地模型调用失败。"
-    assert api.calls == 0
+    client = _make_client(local, api)
+    assert client.generate(Image.new("RGB", (1, 1)), "p") == "x"
+    assert local.calls == 1
+    assert api.calls == 1
 
 
-def test_authorized_load_failure_one_fallback_round() -> None:
-    """已授权 load 失败进入一次 API fallback;backend 自身 1+3 retry。"""
+def test_load_failure_one_fallback_round() -> None:
+    """load 失败进入一次 API fallback;backend 自身 1+3 retry(F4)。"""
     retryable = DashScopeAPIRetryableError("temp")
     api = SequenceBackend([retryable, retryable, retryable, retryable])
     local = RecordingBackend(raise_exc=LocalModelLoadError("load"))
     client = ModelClient(local, api, fallback_enabled=True, max_api_retries=3)
-    client.set_run_fallback_authorization(True)
     assert client.generate(Image.new("RGB", (1, 1)), "p") == "API 模型调用失败。"
     assert local.calls == 1
     assert api.calls == 4
 
 
-def test_inference_failure_no_fallback_even_if_authorized() -> None:
-    """推理失败(非 load 失败)即使授权也不触发 fallback。"""
+def test_inference_failure_no_fallback() -> None:
+    """推理失败(非 load 失败)不触发 fallback(F6)。"""
     local = RecordingBackend(raise_exc=LocalModelInferenceError("infer"))
     api = RecordingBackend(response="x")
-    client = _make_client(local, api, authorized=True)
+    client = _make_client(local, api)
     assert client.generate(Image.new("RGB", (1, 1)), "p") == "本地模型调用失败。"
     assert api.calls == 0
 
 
-def test_output_failure_no_fallback_even_if_authorized() -> None:
-    """输出失败即使授权也不触发 fallback。"""
+def test_output_failure_no_fallback() -> None:
+    """输出失败不触发 fallback(F6b)。"""
     local = RecordingBackend(raise_exc=LocalModelOutputError("empty"))
     api = RecordingBackend(response="x")
-    client = _make_client(local, api, authorized=True)
+    client = _make_client(local, api)
     assert client.generate(Image.new("RGB", (1, 1)), "p") == "本地模型调用失败。"
     assert api.calls == 0
 
 
-def test_fallback_authorization_resets_after_clear() -> None:
-    """clear 后回到 deny;授权状态 non-persistent。"""
+def test_every_run_load_failure_falls_back() -> None:
+    """每个 run 的 load 失败都自动 fallback;无跨 run 授权状态。"""
     local = RecordingBackend(raise_exc=LocalModelLoadError("load"))
     api = RecordingBackend(response="x")
     client = ModelClient(local, api, fallback_enabled=True)
-    client.set_run_fallback_authorization(True)
-    client.clear_run_fallback_authorization()
-    assert client.generate(Image.new("RGB", (1, 1)), "p") == "本地模型调用失败。"
-    assert api.calls == 0
-
-
-def test_run2_does_not_inherit_run1_authorization() -> None:
-    """下一 run 不继承上一 run 的 fallback 授权。"""
-    local = RecordingBackend(raise_exc=LocalModelLoadError("load"))
-    api = RecordingBackend(response="x")
-    client = ModelClient(local, api, fallback_enabled=True)
-    # run1:授权 → fallback
-    client.set_run_fallback_authorization(True)
     client.generate(Image.new("RGB", (1, 1)), "p")
     assert api.calls == 1
-    # run2:clear 后不继承
-    client.clear_run_fallback_authorization()
     local2 = RecordingBackend(raise_exc=LocalModelLoadError("load"))
-    api2 = RecordingBackend(response="x")
+    api2 = RecordingBackend(response="y")
     client._local_backend = local2
     client._api_backend = api2
-    client.generate(Image.new("RGB", (1, 1)), "p")
-    assert api2.calls == 0
+    assert client.generate(Image.new("RGB", (1, 1)), "p") == "y"
+    assert api2.calls == 1
 
 
 def test_no_retry_multiplication_between_layers() -> None:
-    """local 1 次 + API 至多 1+3=4 次,无乘法放大。"""
+    """local 1 次 + API 至多 1+3=4 次,无乘法放大(C4)。"""
     retryable = DashScopeAPIRetryableError("temp")
     api = SequenceBackend([retryable, retryable, retryable, retryable])
     local = RecordingBackend(raise_exc=LocalModelLoadError("load"))
     client = ModelClient(local, api, fallback_enabled=True, max_api_retries=3)
-    client.set_run_fallback_authorization(True)
     client.generate(Image.new("RGB", (1, 1)), "p")
     assert local.calls == 1
     assert api.calls == 4
@@ -476,6 +465,180 @@ def test_capture_falls_back_to_full_screen_when_foreground_unchanged(
     assert all(c.get("region") is None for c in capture.calls)
 
 
+def test_capture_region_follows_dialog_and_cross_app_transitions(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """对话框置前或跨应用切换时,每步 region 跟随当前前台窗口。
+
+    覆盖特性 C/D/E:弹出对话框变为前台后 ROI 即对话框区域,不隐藏
+    新窗口;跨应用往返切换时 region 随每步前台更新。
+    """
+    from perception import screenshot as screen
+
+    rects = {
+        200: (40, 60, 300, 200),  # 应用窗口
+        300: (120, 140, 200, 120),  # 对话框(更小矩形,叠在应用上)
+    }
+    foreground_sequence = iter([200, 300, 200])
+    monkeypatch.setattr("agent.gui_agent.get_foreground_app_hwnd", lambda: 10)
+    monkeypatch.setattr("agent.gui_agent.is_window_available", lambda hwnd: True)
+    monkeypatch.setattr(
+        screen,
+        "get_foreground_app_hwnd",
+        lambda: next(foreground_sequence),
+    )
+    monkeypatch.setattr(screen, "_window_region", lambda hwnd: rects[hwnd])
+    capture = _RegionRecordingCapture()
+    backend = SequenceBackend(
+        [
+            "Action: click(x=10, y=10)",
+            "Action: click(x=20, y=20)",
+            'Action: finish(result="ok")',
+        ],
+    )
+    controls = MemoryControls()
+    manager = TaskManager("跨窗口任务")
+    asyncio.run(
+        make_agent(backend, controls, manager, capture=capture, max_steps=3)(
+            Msg("u", "跨窗口任务", "user"),
+        )
+    )
+    region_calls = [c["region"] for c in capture.calls if c.get("region")]
+    assert region_calls == [
+        (40, 60, 300, 200),
+        (120, 140, 200, 120),
+        (40, 60, 300, 200),
+    ]
+    # 前两步 click 分别按各自 region offset 映射到全局坐标。
+    assert controls.calls == [
+        ("click", 40 + 10, 60 + 10, "left"),
+        ("click", 120 + 20, 140 + 20, "left"),
+    ]
+
+
+class _SizeKeyedRecognizer:
+    """按图像尺寸返回预置 OCR 结果并记录调用尺寸的 fake 识别器。"""
+
+    def __init__(self, items_by_size: dict[tuple[int, int], list[dict]]) -> None:
+        self._items = items_by_size
+        self.calls: list[tuple[int, int]] = []
+
+    def recognize(self, image: Image.Image) -> list[dict]:
+        self.calls.append(image.size)
+        return [dict(item) for item in self._items.get(image.size, [])]
+
+
+def test_roi_empty_ocr_escalates_to_full_frame(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """特性 F:region 感知无元素时升级全帧重识别,坐标基准一并切回全帧。"""
+    from perception import screenshot as screen
+
+    monkeypatch.setattr("agent.gui_agent.get_foreground_app_hwnd", lambda: 10)
+    monkeypatch.setattr("agent.gui_agent.is_window_available", lambda hwnd: True)
+    monkeypatch.setattr(screen, "get_foreground_app_hwnd", lambda: 20)
+    monkeypatch.setattr(
+        screen,
+        "_window_region",
+        lambda hwnd: (40, 60, 200, 100),
+    )
+    recognizer = _SizeKeyedRecognizer(
+        {
+            (1000, 500): [
+                {"text": "背景目标", "bbox": (10, 10, 200, 60), "confidence": 0.95},
+            ],
+        },
+    )
+    capture = _RegionRecordingCapture()
+    backend = SequenceBackend(
+        ["Action: click(x=100, y=50)", 'Action: finish(result="ok")'],
+    )
+    controls = MemoryControls()
+    manager = TaskManager("找背景目标")
+    asyncio.run(
+        make_agent(
+            backend,
+            controls,
+            manager,
+            capture=capture,
+            ocr_recognizer=recognizer,
+        )(
+            Msg("u", "找背景目标", "user"),
+        )
+    )
+    # region 空结果后对全帧重识别,模型看到全帧文字并按全帧坐标点击。
+    assert (1000, 500) in recognizer.calls
+    assert 'text="背景目标"' in backend.prompts[0]
+    assert controls.calls[0] == ("click", 100, 50, "left")
+
+
+def test_roi_nonempty_ocr_skips_full_frame_escalation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """region 感知已有元素时不升级,不做第二次全帧识别。"""
+    from perception import screenshot as screen
+
+    monkeypatch.setattr("agent.gui_agent.get_foreground_app_hwnd", lambda: 10)
+    monkeypatch.setattr("agent.gui_agent.is_window_available", lambda hwnd: True)
+    monkeypatch.setattr(screen, "get_foreground_app_hwnd", lambda: 20)
+    monkeypatch.setattr(
+        screen,
+        "_window_region",
+        lambda hwnd: (40, 60, 200, 100),
+    )
+    recognizer = _SizeKeyedRecognizer(
+        {
+            (200, 100): [
+                {"text": "窗口目标", "bbox": (10, 10, 120, 40), "confidence": 0.9},
+            ],
+        },
+    )
+    capture = _RegionRecordingCapture()
+    backend = SequenceBackend(['Action: finish(result="ok")'])
+    controls = MemoryControls()
+    manager = TaskManager("任务")
+    asyncio.run(
+        make_agent(
+            backend,
+            controls,
+            manager,
+            capture=capture,
+            ocr_recognizer=recognizer,
+        )(
+            Msg("u", "任务", "user"),
+        )
+    )
+    assert recognizer.calls == [(200, 100)]
+    assert 'text="窗口目标"' in backend.prompts[0]
+
+
+def test_full_frame_empty_ocr_does_not_retry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """全屏路径本身无元素时不重复识别,每步只识别一次。"""
+    from perception import screenshot as screen
+
+    monkeypatch.setattr("agent.gui_agent.get_foreground_app_hwnd", lambda: 0)
+    monkeypatch.setattr(screen, "get_foreground_app_hwnd", lambda: 0)
+    recognizer = _SizeKeyedRecognizer({})
+    capture = _RegionRecordingCapture()
+    backend = SequenceBackend(['Action: finish(result="ok")'])
+    controls = MemoryControls()
+    manager = TaskManager("任务")
+    asyncio.run(
+        make_agent(
+            backend,
+            controls,
+            manager,
+            capture=capture,
+            ocr_recognizer=recognizer,
+        )(
+            Msg("u", "任务", "user"),
+        )
+    )
+    assert recognizer.calls == [(1000, 500)]
+
+
 def test_select_region_prefers_foreground_app(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -522,10 +685,7 @@ def test_window_region_clamps_to_virtual_desktop() -> None:
 
     # 真实案例:Chrome 窗口右缘超出 2880 物理屏宽 20 像素。
     region = _normalize_window_region(
-        752,
-        54,
-        2148,
-        1670,
+        (752, 54, 2148, 1670),
         scale=1.0,
         bounds=(0, 0, 2880, 1800),
     )
@@ -533,10 +693,7 @@ def test_window_region_clamps_to_virtual_desktop() -> None:
 
     # DPI 缩放后的窗口矩形同样先缩放再裁剪。
     scaled = _normalize_window_region(
-        376,
-        27,
-        1074,
-        835,
+        (376, 27, 1074, 835),
         scale=2.0,
         bounds=(0, 0, 2880, 1800),
     )
@@ -548,40 +705,28 @@ def test_window_region_rejects_negative_and_tiny_after_clamp() -> None:
     from perception.screenshot import _normalize_window_region
 
     interior = _normalize_window_region(
-        100,
-        100,
-        800,
-        600,
+        (100, 100, 800, 600),
         scale=1.0,
         bounds=(0, 0, 2880, 1800),
     )
     assert interior == (100, 100, 800, 600)
 
     negative = _normalize_window_region(
-        -16,
-        0,
-        1920,
-        1080,
+        (-16, 0, 1920, 1080),
         scale=1.0,
         bounds=(0, 0, 2880, 1800),
     )
     assert negative is None
 
     tiny_after_clamp = _normalize_window_region(
-        2860,
-        100,
-        800,
-        600,
+        (2860, 100, 800, 600),
         scale=1.0,
         bounds=(0, 0, 2880, 1800),
     )
     assert tiny_after_clamp is None
 
     without_bounds = _normalize_window_region(
-        752,
-        54,
-        2148,
-        1670,
+        (752, 54, 2148, 1670),
         scale=1.0,
         bounds=None,
     )
@@ -991,7 +1136,11 @@ def test_vertical_slice_executes_actions_until_finish() -> None:
 def test_explanatory_response_is_rejected_before_retry_action_executes(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """带解释的 Action 不被抽取执行，fresh retry 后只执行严格响应。"""
+    """带解释的 Action 在 API 模式不被抽取执行,fresh retry 后只执行严格响应。
+
+    local 模式自 LOCAL 2B BASELINE 起允许确定性唯一 Action 行修复
+    (见 tests/test_local_output_repair.py),本契约显式固定为 API 路径。
+    """
     backend = SequenceBackend(
         [
             '好的，我来操作。\nAction: hotkey(key1="alt", key2="f4")',
@@ -1007,7 +1156,13 @@ def test_explanatory_response_is_rejected_before_retry_action_executes(
     monkeypatch.setattr(ga, "is_window_available", lambda hwnd: True)
 
     result = asyncio.run(
-        make_agent(backend, controls, manager, retry_count=3)(
+        make_agent(
+            backend,
+            controls,
+            manager,
+            retry_count=3,
+            model_mode="api",
+        )(
             Msg("u", "关闭当前窗口", "user"),
         ),
     )
@@ -1140,8 +1295,8 @@ def test_task_step_action_property_backward_compat() -> None:
     assert step.action["params"]["x"] == 30
 
 
-def test_local_authorized_once_then_fallback_occurs() -> None:
-    """local 模式 authorize_next_run_fallback + load failure → API fallback。"""
+def test_local_load_failure_automatic_fallback_finishes() -> None:
+    """PRD 4.3.1:local load 失败自动切 API,无需授权,任务经 API 完成(F2/F3)。"""
     api = SequenceBackend(['Action: finish(result="fallback_ok")'])
     local = RecordingBackend(raise_exc=LocalModelLoadError("load"))
     client = ModelClient(local, api, fallback_enabled=True)
@@ -1162,10 +1317,9 @@ def test_local_authorized_once_then_fallback_occurs() -> None:
     )
     agent = GuiAgent(dependencies, settings)
 
-    agent.authorize_next_run_fallback()
     result = asyncio.run(agent(Msg("u", "任务", "user")))
 
-    # load failure + authorized → 一次 API fallback,成功 finish。
+    # load failure → 一次自动 API fallback,成功 finish,无需任何授权调用。
     assert result.content == "fallback_ok"
     assert local.calls == 1
     assert api.calls == 1
@@ -1192,25 +1346,25 @@ def test_next_local_run_without_reauthorization_zero_api() -> None:
     )
     agent = GuiAgent(dependencies, settings)
 
-    # run1:授权 → fallback 成功。
-    agent.authorize_next_run_fallback()
+    # run1:load 失败 → 自动 fallback 成功。
     r1 = asyncio.run(agent(Msg("u", "任务", "user")))
     assert r1.content == "run1"
     assert api1.calls == 1
 
-    # run2:不重新授权 → 零 API 调用。
+    # run2:load 失败 → 再次自动 fallback(PRD 4.3.1 无跨 run 授权状态)。
     local2 = RecordingBackend(raise_exc=LocalModelLoadError("load"))
-    api2 = RecordingBackend(response="x")
+    api2 = SequenceBackend(['Action: finish(result="run2")'])
     client._local_backend = local2
     client._api_backend = api2
-    asyncio.run(agent(Msg("u", "任务2", "user")))
-    assert api2.calls == 0
+    r2 = asyncio.run(agent(Msg("u", "任务2", "user")))
+    assert r2.content == "run2"
+    assert api2.calls == 1
 
 
-def test_local_unauthorized_load_failure_zero_api() -> None:
-    """local 未授权 + load failure → 零 API 调用。"""
-    local = RecordingBackend(raise_exc=LocalModelLoadError("load"))
-    api = RecordingBackend(response="x")
+def test_manual_api_mode_unchanged_by_fallback_removal() -> None:
+    """manual API 模式行为不变:直接走 API 后端,不触碰 local(F5)。"""
+    api = SequenceBackend(['Action: finish(result="api_mode")'])
+    local = RecordingBackend(response="never")
     client = ModelClient(local, api, fallback_enabled=True)
 
     controls = MemoryControls()
@@ -1222,10 +1376,16 @@ def test_local_unauthorized_load_failure_zero_api() -> None:
         task_manager_factory=lambda task: manager,
         sleep=lambda seconds: None,
     )
-    settings = GuiAgentSettings(model_mode="local", max_steps=1)
+    settings = GuiAgentSettings(
+        model_mode="api",
+        reject_initial_finish=False,
+        verify_action_effect=False,
+    )
     agent = GuiAgent(dependencies, settings)
-    asyncio.run(agent(Msg("u", "任务", "user")))
-    assert api.calls == 0
+    result = asyncio.run(agent(Msg("u", "任务", "user")))
+    assert result.content == "api_mode"
+    assert local.calls == 0
+    assert api.calls == 1
 
 
 def test_model_fail_all_retries_step_record_exists() -> None:
@@ -1396,6 +1556,60 @@ def test_dispatcher_maps_extended_mouse_actions() -> None:
     ]
 
 
+def test_repeated_strategy_allows_quantified_progress() -> None:
+    """同一动作正在推进量化事实时不得被无进展保护误拦。"""
+    from dataclasses import replace
+
+    from agent.action_parser import ActionPromptState
+
+    agent = make_agent(
+        SequenceBackend(['Action: finish(result="done")']),
+        MemoryControls(),
+        TaskManager("任务"),
+        decision_protocol_v3=True,
+    )
+    action = {"action_type": "hotkey", "params": {"keys": ("media_volume_up",)}}
+    serialized = 'hotkey(key1="media_volume_up")'
+    base = ActionPromptState(
+        step_number=3,
+        max_steps=10,
+        last_action=serialized,
+        same_action_streak=2,
+        ui_change_signal="weak",
+    )
+    assert agent._repeated_strategy_blocked(action, base)
+    progressed = replace(base, progress_status="INSUFFICIENT_RATE")
+    assert not agent._repeated_strategy_blocked(action, progressed)
+
+
+def test_hidden_raw_foreground_disappearance_is_not_window_close(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """最小化终端的 raw HWND 消失不能冒充业务应用窗口关闭。"""
+    from agent import gui_agent as gui_agent_module
+
+    agent = make_agent(
+        SequenceBackend(['Action: finish(result="done")']),
+        MemoryControls(),
+        TaskManager("任务"),
+    )
+    frame = Image.new("RGB", (40, 40), "black")
+    monkeypatch.setattr(agent, "_wait_for_ui_stable", lambda: frame)
+    monkeypatch.setattr(gui_agent_module, "get_foreground_hwnd", lambda: 200)
+    monkeypatch.setattr(
+        gui_agent_module,
+        "is_window_existing",
+        lambda hwnd: hwnd != 100,
+    )
+    observation = agent._verify_action_effect(
+        "click",
+        frame,
+        before_foreground=100,
+        before_app_foreground=300,
+    )
+    assert observation.effect == "foreground_window_changed"
+
+
 def test_make_agent_accepts_ocr_recognizer_none() -> None:
     """make_agent 支持省略 OCR(默认 None 不启用)。"""
     agent = make_agent(
@@ -1429,3 +1643,556 @@ def test_scale_image_for_model_downscales_and_preserves_small() -> None:
 
     low_res = Image.new("RGB", (1024, 768))
     assert scale_image_for_model(low_res, 1280).size == (1024, 768)
+
+
+class _RecordingDiagnosticsWriter:
+    """内存 fake 诊断写入器:记录事件,可选抛异常验证失败安全。"""
+
+    def __init__(self, raise_exc: Exception | None = None) -> None:
+        self.records: list[DiagnosticsRecord] = []
+        self._exc = raise_exc
+
+    def record(self, record: "DiagnosticsRecord") -> None:
+        self.records.append(record)
+        if self._exc is not None:
+            raise self._exc
+
+
+def test_parse_failure_records_diagnostics_with_response() -> None:
+    """解析失败时记录 prompt、原始响应、步骤与尝试序号。"""
+    writer = _RecordingDiagnosticsWriter()
+    backend = SequenceBackend(["这不是动作"] * 4)
+    manager = TaskManager("任务")
+    asyncio.run(
+        make_agent(
+            backend,
+            MemoryControls(),
+            manager,
+            max_steps=1,
+            retry_count=3,
+            diagnostics_writer=writer,
+        )(
+            Msg("u", "任务", "user"),
+        ),
+    )
+    # 单步内 initial + 3 次 fresh retry 均解析失败,每次 attempt 都有诊断。
+    assert len(writer.records) == 4
+    first = writer.records[0]
+    assert first.response == "这不是动作"
+    assert first.step_number == 1
+    assert first.attempt == 0
+    assert first.exception_type is None
+    assert first.failure_reason.startswith("模型动作解析失败。")
+    assert first.run_id.startswith("run_")
+    # prompt 与发送给后端的是同一份完整文本。
+    assert first.prompt == backend.prompts[0]
+    assert "任务" in first.prompt
+
+
+def test_model_exception_records_diagnostics_without_response() -> None:
+    """模型调用抛异常时记录 response=None 与异常类型名。"""
+    writer = _RecordingDiagnosticsWriter()
+    backend = SequenceBackend([RuntimeError("boom")])
+    manager = TaskManager("任务")
+    asyncio.run(
+        make_agent(
+            backend,
+            MemoryControls(),
+            manager,
+            max_steps=1,
+            retry_count=0,
+            diagnostics_writer=writer,
+        )(
+            Msg("u", "任务", "user"),
+        ),
+    )
+    assert len(writer.records) == 1
+    record = writer.records[0]
+    assert record.response is None
+    assert record.exception_type == "RuntimeError"
+    assert record.failure_reason == "模型调用失败。"
+
+
+def test_api_exhausted_failure_records_diagnostics() -> None:
+    """API 重试耗尽的固定响应进入诊断记录,reason 为 api_retry_exhausted。"""
+    writer = _RecordingDiagnosticsWriter()
+    backend = SequenceBackend(["API 模型调用失败。"] * 3)
+    manager = TaskManager("任务")
+    asyncio.run(
+        make_agent(
+            backend,
+            MemoryControls(),
+            manager,
+            max_steps=2,
+            diagnostics_writer=writer,
+        )(
+            Msg("u", "任务", "user"),
+        ),
+    )
+    # max_steps=2 内每步一次 API 耗尽,均留诊断记录。
+    assert len(writer.records) == 2
+    record = writer.records[0]
+    assert record.response == "API 模型调用失败。"
+    assert record.failure_reason == "api_retry_exhausted"
+
+
+def test_successful_run_records_no_diagnostics() -> None:
+    """成功运行不写任何诊断事件。"""
+    writer = _RecordingDiagnosticsWriter()
+    backend = SequenceBackend(
+        ["Action: click(x=1, y=1)", 'Action: finish(result="done")'],
+    )
+    asyncio.run(
+        make_agent(
+            backend,
+            MemoryControls(),
+            TaskManager("任务"),
+            diagnostics_writer=writer,
+        )(
+            Msg("u", "任务", "user"),
+        ),
+    )
+    assert writer.records == []
+
+
+def test_diagnostics_writer_failure_does_not_break_task() -> None:
+    """诊断写入器抛异常时任务流程不受影响。"""
+    writer = _RecordingDiagnosticsWriter(raise_exc=OSError("disk full"))
+    backend = SequenceBackend(["这不是动作", 'Action: finish(result="ok")'])
+    result = asyncio.run(
+        make_agent(
+            backend,
+            MemoryControls(),
+            TaskManager("任务"),
+            diagnostics_writer=writer,
+        )(
+            Msg("u", "任务", "user"),
+        ),
+    )
+    assert result.content == "ok"
+
+
+def test_diagnostics_run_id_scoped_to_single_run() -> None:
+    """run 标识在任务结束后清空,两次 run 的诊断归属各自 JSONL。"""
+    writer = _RecordingDiagnosticsWriter()
+    backend = SequenceBackend(["这不是动作", 'Action: finish(result="ok")'])
+    agent = make_agent(
+        backend,
+        MemoryControls(),
+        TaskManager("任务"),
+        diagnostics_writer=writer,
+    )
+    asyncio.run(agent(Msg("u", "任务", "user")))
+    backend2 = SequenceBackend(["这不是动作", 'Action: finish(result="ok2")'])
+    agent2 = make_agent(
+        backend2,
+        MemoryControls(),
+        TaskManager("任务2"),
+        diagnostics_writer=writer,
+    )
+    asyncio.run(agent2(Msg("u", "任务2", "user")))
+    assert len(writer.records) == 2
+    assert writer.records[0].run_id != writer.records[1].run_id
+
+
+def test_diagnostics_writer_validation_rejects_non_callable() -> None:
+    """diagnostics_writer 必须提供可调用 record,否则构造时拒绝。"""
+    controls = MemoryControls()
+    with pytest.raises(TypeError):
+        GuiAgentDependencies(
+            model_client=SequenceBackend([]),
+            action_dispatcher=ActionDispatcher(controls, controls),
+            capture=CountingCapture(),
+            task_manager_factory=lambda task: TaskManager("任务"),
+            sleep=lambda seconds: None,
+            diagnostics_writer=123,  # type: ignore[arg-type]
+        )
+
+
+def test_diagnostics_writer_writes_jsonl_and_png(tmp_path) -> None:
+    """production 写入器把 JSONL 行与 PNG 截图落盘到 diagnosis 子目录。"""
+    import json
+
+    from PIL import Image
+
+    from agent.diagnostics import ActionDiagnosticsWriter, DiagnosticsRecord
+
+    writer = ActionDiagnosticsWriter(tmp_path)
+    image = Image.new("RGB", (4, 4))
+    writer.record(
+        DiagnosticsRecord(
+            run_id="run_x",
+            step_number=2,
+            attempt=1,
+            image=image,
+            prompt="prompt文本",
+            response="原始响应",
+            failure_reason="模型动作解析失败。 (invalid_format)",
+        )
+    )
+    diagnosis_dir = tmp_path / "diagnosis"
+    png = diagnosis_dir / "run_x_step2_att1.png"
+    assert png.exists()
+    jsonl = diagnosis_dir / "run_x.jsonl"
+    assert jsonl.exists()
+    entry = json.loads(jsonl.read_text(encoding="utf-8").splitlines()[0])
+    assert entry["run_id"] == "run_x"
+    assert entry["step_number"] == 2
+    assert entry["attempt"] == 1
+    assert entry["prompt"] == "prompt文本"
+    assert entry["response"] == "原始响应"
+    assert entry["screenshot"] == "run_x_step2_att1.png"
+    assert entry["failure_reason"] == "模型动作解析失败。 (invalid_format)"
+    assert entry["exception_type"] is None
+    assert entry["timestamp"]
+
+
+def test_diagnostics_writer_validates_fields(tmp_path) -> None:
+    """字段类型或值域错误在写入副作用前抛出。"""
+    from PIL import Image
+
+    from agent.diagnostics import ActionDiagnosticsWriter, DiagnosticsRecord
+
+    writer = ActionDiagnosticsWriter(tmp_path)
+    image = Image.new("RGB", (2, 2))
+    base = dict(
+        run_id="run_x",
+        step_number=1,
+        attempt=0,
+        image=image,
+        prompt="p",
+        response="r",
+        failure_reason="失败",
+    )
+
+    def expect_invalid(exc: type[Exception], **override: object) -> None:
+        with pytest.raises(exc):
+            writer.record(
+                DiagnosticsRecord(  # type: ignore[arg-type]  # 负向
+                    **{**base, **override}
+                )
+            )
+
+    expect_invalid(ValueError, run_id="")
+    expect_invalid(ValueError, step_number=0)
+    expect_invalid(ValueError, attempt=-1)
+    expect_invalid(TypeError, image="not-image")
+    expect_invalid(TypeError, prompt=1)
+    expect_invalid(TypeError, response=1)
+    with pytest.raises(ValueError):
+        writer.record(DiagnosticsRecord(**{**base, "failure_reason": ""}))
+    with pytest.raises(TypeError):
+        writer.record(DiagnosticsRecord(**{**base, "exception_type": 5}))
+    # 全部校验失败都不产生任何文件。
+    assert not (tmp_path / "diagnosis").exists()
+
+
+def test_diagnostics_writer_io_failure_is_swallowed(
+    tmp_path, monkeypatch, caplog
+) -> None:
+    """落盘 I/O 失败只记 warning,不向调用方抛出。"""
+    import logging
+
+    from PIL import Image
+
+    from agent.diagnostics import ActionDiagnosticsWriter, DiagnosticsRecord
+
+    writer = ActionDiagnosticsWriter(tmp_path)
+
+    def _fail_save(self, path, format=None):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(Image.Image, "save", _fail_save)
+    with caplog.at_level(logging.WARNING):
+        writer.record(
+            DiagnosticsRecord(
+                run_id="run_x",
+                step_number=1,
+                attempt=0,
+                image=Image.new("RGB", (2, 2)),
+                prompt="p",
+                response="r",
+                failure_reason="失败",
+            )
+        )
+    assert any(
+        "diagnostics_write_failed" in record.message
+        for record in caplog.records
+        if record.levelno == logging.WARNING
+    )
+
+
+def test_diagnostics_writer_rejects_non_path_log_dir() -> None:
+    """log_dir 类型错误在构造时拒绝。"""
+    from agent.diagnostics import ActionDiagnosticsWriter
+
+    with pytest.raises(TypeError):
+        ActionDiagnosticsWriter("logs")  # type: ignore[arg-type]
+
+
+def test_parse_failure_retry_prompt_contains_format_feedback() -> None:
+    """解析失败后的 fresh retry 携带格式纠正提示(经既有 last_error 通道)。"""
+    backend = SequenceBackend(
+        ["不是动作", 'Action: finish(result="ok")'],
+    )
+    result = asyncio.run(
+        make_agent(
+            backend,
+            MemoryControls(),
+            TaskManager("任务"),
+            retry_count=3,
+        )(
+            Msg("u", "任务", "user"),
+        ),
+    )
+    assert result.content == "ok"
+    # 第二次调用的 Prompt 应包含针对上次解析失败的纠正提示
+    assert len(backend.prompts) == 2
+    assert "上次" in backend.prompts[1]
+    assert "Action" in backend.prompts[1]
+
+
+# ======================================================================
+# E2-B characterization:_ocr_target_window_text 的显示器坐标帧
+# ======================================================================
+
+
+@pytest.mark.parametrize(
+    (
+        "virtual_origin",
+        "window_rect",
+        "expected_region",
+        "case_label",
+    ),
+    [
+        ((0, 0), (100, 50, 300, 200), (100, 50, 300, 200), "主屏原点"),
+        ((0, 0), (2000, 60, 300, 200), (2000, 60, 300, 200), "正偏移副屏"),
+        (
+            (-1920, 0),
+            (100, 50, 300, 200),
+            (2020, 50, 300, 200),
+            "负 X 虚拟原点",
+        ),
+    ],
+)
+def test_ocr_window_region_monitor_frames(
+    monkeypatch,
+    virtual_origin,
+    window_rect,
+    expected_region,
+    case_label,
+) -> None:
+    """窗口矩形按虚拟桌面绝对坐标换算为 monitors[0] 相对 region。
+
+    坐标空间:窗口矩形=VIRTUAL_DESKTOP_ABSOLUTE;capture_screen 的
+    region=MONITOR_LOCAL(monitors[0]);换算=减虚拟桌面原点。
+    """
+    from PIL import Image
+
+    import perception.screenshot as screenshot_module
+    from agent import gui_agent as ga_module
+
+    monkeypatch.setattr(
+        screenshot_module,
+        "get_window_screen_rect_clipped",
+        lambda hwnd: window_rect,
+        raising=True,
+    )
+    monkeypatch.setattr(
+        screenshot_module,
+        "virtual_desktop_origin",
+        lambda: virtual_origin,
+        raising=True,
+    )
+    captured: dict[str, object] = {}
+
+    def fake_capture(**kwargs: object) -> Image.Image:
+        captured.update(kwargs)
+        return Image.new("RGB", (8, 8))
+
+    agent = make_agent(
+        SequenceBackend(['Action: finish(result="done")']),
+        MemoryControls(),
+        TaskManager("任务"),
+        capture=fake_capture,
+    )
+    monkeypatch.setattr(
+        ga_module.prompt_context,
+        "perceive_ocr_elements_detailed",
+        lambda recognizer, image, point: ((), [{"text": "ok"}]),
+        raising=True,
+    )
+    agent._ocr_target_window_text(4242)
+    assert captured["region"] == expected_region, case_label
+
+
+def test_ocr_window_result_band_uses_relative_height(monkeypatch) -> None:
+    """结果带按窗口相对高度裁剪，不依赖桌面固定坐标。"""
+    import perception.screenshot as screenshot_module
+    from agent import gui_agent as gui_agent_module
+
+    monkeypatch.setattr(
+        screenshot_module,
+        "get_window_screen_rect_clipped",
+        lambda hwnd: (100, 50, 301, 201),
+    )
+    monkeypatch.setattr(screenshot_module, "virtual_desktop_origin", lambda: (0, 0))
+    captured: dict[str, object] = {}
+
+    def fake_capture(**kwargs: object) -> Image.Image:
+        captured.update(kwargs)
+        return Image.new("RGB", (8, 8))
+
+    agent = make_agent(
+        SequenceBackend(['Action: finish(result="done")']),
+        MemoryControls(),
+        TaskManager("任务"),
+        capture=fake_capture,
+    )
+    monkeypatch.setattr(
+        gui_agent_module.prompt_context,
+        "perceive_ocr_elements_detailed",
+        lambda recognizer, image, point: ((), ()),
+    )
+    agent._ocr_target_window_text(4242, 0.32)
+    assert captured["region"] == (100, 50, 301, 64)
+
+
+def test_calculator_operand_is_not_treated_as_evaluated_result() -> None:
+    """结果带只有当前操作数时仍属未完成，必须出现等号完成态。"""
+    from agent.gui_agent import _evaluated_calculator_result_text
+
+    assert _evaluated_calculator_result_text("1 + 2") == ""
+    assert _evaluated_calculator_result_text("1 + 1 = 2") == "1 + 1 = 2"
+
+
+@pytest.mark.parametrize(
+    ("response", "current", "dispatched", "expected"),
+    [
+        (r'Action: type(text="a\tb\nc\td")', False, True, True),
+        (r'Action: type(text="a\tb\nc\td\n")', True, True, False),
+        ('Action: type(text="hello")', False, True, False),
+        (r'Action: type(text="a\tb")', False, False, False),
+    ],
+)
+def test_structured_entry_pending_classification(
+    response: str,
+    current: bool,
+    dispatched: bool,
+    expected: bool,
+) -> None:
+    """只有成功分发且末项未提交的 structured type 才设置 pending。"""
+    from agent.action_parser import parse_prd_action
+    from agent.gui_agent import _updated_structured_entry_pending
+
+    action = parse_prd_action(response)
+    assert action is not None
+    assert _updated_structured_entry_pending(current, action, dispatched) is expected
+
+
+def test_structured_entry_pending_clears_only_on_explicit_commit_navigation() -> None:
+    """pending 只由成功分发的单键提交/导航动作清除。"""
+    from agent.action_parser import parse_prd_action
+    from agent.gui_agent import _updated_structured_entry_pending
+
+    enter = parse_prd_action('Action: hotkey(key1="enter")')
+    tab = parse_prd_action('Action: hotkey(key1="tab")')
+    unrelated = parse_prd_action('Action: hotkey(key1="ctrl", key2="s")')
+    assert enter is not None
+    assert tab is not None
+    assert unrelated is not None
+
+    assert not _updated_structured_entry_pending(True, enter, True)
+    assert not _updated_structured_entry_pending(True, tab, True)
+    assert _updated_structured_entry_pending(True, tab, False)
+    assert _updated_structured_entry_pending(True, unrelated, True)
+
+
+@pytest.mark.parametrize("model_mode", ["api", "local"])
+def test_structured_entry_finish_guard_recovers_then_allows_finish(
+    model_mode: str,
+) -> None:
+    """API/local 共用 guard：拒绝过早 finish，提交后允许正常完成。"""
+    backend = SequenceBackend(
+        [
+            r'Action: type(text="a\tb\nc\td")',
+            'Action: finish(result="premature")',
+            'Action: hotkey(key1="tab")',
+            'Action: finish(result="done")',
+        ],
+    )
+    controls = MemoryControls()
+    manager = TaskManager("录入多字段数据")
+    agent = make_agent(
+        backend,
+        controls,
+        manager,
+        max_steps=4,
+        retry_count=0,
+        model_mode=model_mode,
+        decision_protocol_v3=True,
+    )
+
+    result = asyncio.run(agent(Msg("u", "录入多字段数据", "user")))
+
+    assert result.content == "done"
+    assert controls.calls == [
+        ("type", "a\tb\nc\td"),
+        ("hotkey", "tab"),
+    ]
+    recovery_prompt = backend.prompts[2]
+    assert (
+        "Previous structured entry may still have its final field" in recovery_prompt
+        or "上一结构化输入可能仍有最后字段处于编辑状态" in recovery_prompt
+    )
+    feedback_slice = (
+        recovery_prompt.split("Recovery feedback:", 1)[1].split(
+            "Current perception:",
+            1,
+        )[0]
+        if "Recovery feedback:" in recovery_prompt
+        else next(
+            line
+            for line in recovery_prompt.splitlines()
+            if "上一结构化输入可能仍有最后字段处于编辑状态" in line
+        )
+    )
+    for forbidden in ("Enter", "Tab", "Excel", "C4", "M01"):
+        assert forbidden not in feedback_slice
+    finish_attempt = manager.state.steps[1].attempts[0]
+    assert finish_attempt.stage == "finish"
+    assert finish_attempt.succeeded is False
+    assert "最后字段处于编辑状态" in (finish_attempt.failure_reason or "")
+
+
+def test_structured_entry_pending_resets_at_new_task_boundary() -> None:
+    """同一 Agent 开始新任务时清空上一任务的 pending 状态。"""
+    from dataclasses import replace
+
+    backend = SequenceBackend(
+        [
+            r'Action: type(text="a\tb")',
+            'Action: finish(result="new-task-done")',
+        ],
+    )
+    agent = make_agent(
+        backend,
+        MemoryControls(),
+        TaskManager("首次任务"),
+        max_steps=1,
+        retry_count=0,
+        decision_protocol_v3=True,
+    )
+    agent._dependencies = replace(
+        agent._dependencies,
+        task_manager_factory=TaskManager,
+    )
+
+    first = asyncio.run(agent(Msg("u", "首次任务", "user")))
+    assert "任务执行失败" in first.content
+    agent._pending_structured_entry_commit = True
+
+    second = asyncio.run(agent(Msg("u", "新任务", "user")))
+
+    assert second.content == "new-task-done"
+    assert agent._pending_structured_entry_commit is False

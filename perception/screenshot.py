@@ -24,6 +24,7 @@ import logging
 import os
 import threading
 from collections.abc import Callable
+from typing import Literal
 
 import mss
 from mss.exception import ScreenShotError as MssScreenShotError
@@ -106,7 +107,10 @@ def activate_window(hwnd: int) -> bool:
         return False
 
 
-def get_focus_control_kind() -> str:
+FocusControlKindLiteral = Literal["text_input", "other", "none", "unknown"]
+
+
+def get_focus_control_kind() -> FocusControlKindLiteral:
     """返回前台线程焦点控件类别：text_input/other/none/unknown。
 
     依据 GetGUIThreadInfo 的 hwndFocus 与窗口类名判断；任何查询失败都返回
@@ -138,8 +142,12 @@ def get_focus_control_kind() -> str:
         return "unknown"
 
 
-def _load_user32() -> object | None:
-    """返回 Windows user32；其他平台返回 None。"""
+def _load_user32() -> "ctypes.WinDLL | None":
+    """返回 Windows user32；其他平台返回 None。
+
+    WinDLL 属性经 typeshed 的 __getattr__ 得到可调用 _FuncPtr,是
+    ctypes 动态 API 的诚实边界类型。
+    """
     loader = getattr(ctypes, "windll", None)
     return None if loader is None else loader.user32
 
@@ -148,7 +156,8 @@ def get_window_screen_rect(hwnd: int) -> tuple[int, int, int, int] | None:
     """返回窗口裁剪到虚拟桌面内的物理矩形;供点击目标命中判定。
 
     与 ``_window_region`` 不同,本函数不做最小边长过滤,命令行等小窗口
-    也能返回可见矩形;无法取得可靠几何时返回 None。
+    也能返回可见矩形;无法取得可靠几何时返回 None。负原点(最大化边框
+    溢出)窗口按既有截图行为拒绝并返回 None。
     """
     user32 = _load_user32()
     if not hwnd or user32 is None:
@@ -157,14 +166,49 @@ def get_window_screen_rect(hwnd: int) -> tuple[int, int, int, int] | None:
     if not user32.GetWindowRect(hwnd, ctypes.byref(rect)):
         return None
     return _normalize_window_region(
-        rect.left,
-        rect.top,
-        rect.right - rect.left,
-        rect.bottom - rect.top,
+        (rect.left, rect.top, rect.right - rect.left, rect.bottom - rect.top),
         _dpi_scale_for_hwnd(user32, hwnd),
         _virtual_desktop_bounds(),
         min_side=None,
     )
+
+
+def get_window_screen_rect_clipped(
+    hwnd: int,
+) -> tuple[int, int, int, int] | None:
+    """返回窗口的物理矩形,负原点按虚拟桌面可见范围截断。
+
+    最大化窗口的原始矩形带有超出屏幕的负边框偏移(如 -7px),
+    ``get_window_screen_rect`` 按截图路径的回退语义对其返回 None;
+    窗口内容 OCR 等只读验证场景没有全屏回退,需要的是"窗口可见部分"
+    的区域,因此本函数把负原点截断到 0 并裁剪到虚拟桌面内。
+    窗口完全不在桌面内时返回 None。
+    """
+    user32 = _load_user32()
+    if not hwnd or user32 is None:
+        return None
+    rect = _Rect()
+    if not user32.GetWindowRect(hwnd, ctypes.byref(rect)):
+        return None
+    scale = _dpi_scale_for_hwnd(user32, hwnd)
+    left = round(rect.left * scale)
+    top = round(rect.top * scale)
+    width = round((rect.right - rect.left) * scale)
+    height = round((rect.bottom - rect.top) * scale)
+    if left < 0:
+        width += left
+        left = 0
+    if top < 0:
+        height += top
+        top = 0
+    bounds = _virtual_desktop_bounds()
+    if bounds is not None:
+        bounds_left, bounds_top, bounds_width, bounds_height = bounds
+        width = min(width, bounds_left + bounds_width - left)
+        height = min(height, bounds_top + bounds_height - top)
+    if width <= 0 or height <= 0:
+        return None
+    return left, top, width, height
 
 
 def list_visible_windows_zorder() -> list[dict[str, object]]:
@@ -307,7 +351,7 @@ def get_foreground_app_hwnd() -> int:
     return 0 if user32.GetWindowTextLengthW(hwnd) == 0 else hwnd
 
 
-def _dpi_scale_for_hwnd(user32: object, hwnd: int) -> float:
+def _dpi_scale_for_hwnd(user32: "ctypes.WinDLL", hwnd: int) -> float:
     """返回 Windows 逻辑坐标到物理像素的缩放系数。"""
     try:
         if user32.IsProcessDPIAware():
@@ -327,20 +371,14 @@ def _window_region(hwnd: int) -> tuple[int, int, int, int] | None:
     if not user32.GetWindowRect(hwnd, ctypes.byref(rect)):
         return None
     return _normalize_window_region(
-        rect.left,
-        rect.top,
-        rect.right - rect.left,
-        rect.bottom - rect.top,
+        (rect.left, rect.top, rect.right - rect.left, rect.bottom - rect.top),
         _dpi_scale_for_hwnd(user32, hwnd),
         _virtual_desktop_bounds(),
     )
 
 
 def _normalize_window_region(
-    left: int,
-    top: int,
-    width: int,
-    height: int,
+    rect: tuple[int, int, int, int],
     scale: float,
     bounds: tuple[int, int, int, int] | None,
     min_side: int | None = _MIN_APP_WINDOW_SIDE,
@@ -352,6 +390,7 @@ def _normalize_window_region(
     整体拒绝并回退全屏,因此这里先按可见范围裁剪。负原点窗口保持拒绝
     回退全屏,维持最大化窗口的既有截图行为。
     """
+    left, top, width, height = rect
     left = round(left * scale)
     top = round(top * scale)
     width = round(width * scale)
@@ -389,6 +428,18 @@ def _virtual_desktop_bounds() -> tuple[int, int, int, int] | None:
     if width <= 0 or height <= 0:
         return None
     return left, top, width, height
+
+
+def virtual_desktop_origin() -> tuple[int, int] | None:
+    """返回 mss 虚拟桌面汇总(monitors[0])的左上角原点;失败返回 None。
+
+    供把虚拟桌面绝对坐标(如窗口物理矩形)换算为 ``capture_screen``
+    的 monitors[0] 相对 region;原点不可读时调用方应放弃本次换算。
+    """
+    bounds = _virtual_desktop_bounds()
+    if bounds is None:
+        return None
+    return bounds[0], bounds[1]
 
 
 def select_capture_region(

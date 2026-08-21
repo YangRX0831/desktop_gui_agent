@@ -329,7 +329,8 @@ def annotate_ui_elements(
     validated_elements: list[UIElement] | None = None
     if cache_key is not None and cache_key in _ELEMENT_CACHE:
         # 命中:复用已验证的 canonical element info(深复制防污染)。
-        validated_elements = [dict(e) for e in _ELEMENT_CACHE[cache_key]]
+        cached = cast(list[UIElement], _ELEMENT_CACHE[cache_key])
+        validated_elements = cast(list[UIElement], [dict(e) for e in cached])
 
     if validated_elements is None:
         validated_elements = _validate_elements(elements, source_image)

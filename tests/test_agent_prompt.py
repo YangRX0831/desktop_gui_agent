@@ -24,19 +24,29 @@ from tests.agent_test_support import (
 
 
 def test_action_system_prompt_preserves_protocol_and_adds_guardrails() -> None:
-    """分节 supplement 保留 PRD 协议、新动作语义且不含任务配方。"""
+    """Production Prompt 明示 PRD 五动作协议且不含任务配方。"""
     assert ACTION_SYSTEM_PROMPT != PRD_ACTION_SYSTEM_PROMPT
     for marker in (
-        "合法动作(唯一协议，每轮只输出一个)",
+        "合法动作(唯一协议，只存在以下五种，每轮只输出一个)",
         "1. click(x=<整数>, y=<整数>) - 单击可见控件",
-        "2. right_click(x=<整数>, y=<整数>) - 打开目标的上下文菜单",
-        "3. double_click(x=<整数>, y=<整数>) - 双击打开或激活对象",
-        "4. drag(x1=<整数>, y1=<整数>, x2=<整数>, y2=<整数>)",
-        '8. finish(result="<结果描述>") - 任务完成',
+        '2. type(text="<文本>") - 输入文本',
+        '3. scroll(direction="<up/down>", steps=<整数>) - 滚动屏幕',
+        '4. hotkey(key1="<按键1>", key2="<按键2>", ...) - 按下组合键',
+        '5. finish(result="<结果描述>") - 任务完成',
         "必须以Action: 开头",
+        "参数名称不可省略",
+        "禁止位置参数或命名参数与位置参数混用",
+        "click必须同时包含",
+        "x=<整数>和y=<整数>",
+        "只能使用上述五种动作",
+        "禁止发明drag",
+        "正例：Action: click(x=123, y=456)",
+        "反例：Action: click(x=123, 456)",
+        "Action: click(123, 456)",
+        "Action: drag(...)",
+        "只有任务确实完成时才能使用finish",
         "现在只输出Action",
         "不得猜测不可见目标的坐标",
-        "不再用两个连续click模拟双击",
         "platform为windows时系统键使用win",
         "system_volume是当前系统主音量百分比",
         "keyboard_input_ready=true时可直接type",
@@ -50,14 +60,46 @@ def test_action_system_prompt_preserves_protocol_and_adds_guardrails() -> None:
         "不得因前台变化重新绑定",
         "只有在程序可靠验证目标window id已关闭时才成立",
         "只有用户明确要求且当前目标对象与用户目标匹配时才执行",
-        "click、right_click、double_click不得省略x=或y=",
+        "click不得省略x=或y=",
     ):
         assert marker in ACTION_SYSTEM_PROMPT
+
+
+def test_repeated_strategy_feedback_is_structured_and_conditional() -> None:
+    """被阻止的重复策略以通用结构化事实进入下一次动态上下文。"""
+    default_prompt = compose_action_prompt(
+        "执行桌面任务",
+        ActionPromptState(step_number=2, max_steps=10),
+        "normalized_1000",
+    )
+    assert "Recovery feedback:" not in default_prompt
+
+    recovery_prompt = compose_action_prompt(
+        "执行桌面任务",
+        ActionPromptState(
+            step_number=2,
+            max_steps=10,
+            last_action="click(x=480, y=883)",
+            last_dispatch_status="failure",
+            last_error="重复无效动作已被程序阻止，必须更换策略。",
+            previous_strategy_failed=True,
+            blocked_repeated_action="click(x=480, y=883)",
+        ),
+        "normalized_1000",
+    )
+    assert "Recovery feedback:" in recovery_prompt
+    assert "- previous_action=click(x=480, y=883)" in recovery_prompt
+    assert "- observed_result=动作未分发" in recovery_prompt
+    assert "- required_change=不要再次返回同一动作" in recovery_prompt
     assert 'Action: type(text="Hello World")' not in ACTION_SYSTEM_PROMPT
     for benchmark_name in ("Chrome", "Python", "计算器", "记事本"):
         assert benchmark_name not in ACTION_SYSTEM_PROMPT
     for unsupported in ("press(", "release(", "move_to("):
         assert unsupported not in ACTION_SYSTEM_PROMPT
+
+    grammar_section = ACTION_SYSTEM_PROMPT.split("输出协议：", 1)[0]
+    for unsupported_action in ("right_click(", "double_click(", "drag("):
+        assert unsupported_action not in grammar_section
 
 
 def test_production_prompt_keeps_prd_concat_contract() -> None:
@@ -106,6 +148,29 @@ def test_production_prompt_keeps_prd_concat_contract() -> None:
     assert "图像像素坐标" in next_prompt
 
 
+def test_structured_entry_commit_feedback_is_generic_and_dynamic() -> None:
+    """待提交恢复反馈只描述通用编辑状态，不泄漏任务或具体提交动作。"""
+    prompt = compose_action_prompt(
+        "录入多字段数据",
+        ActionPromptState(
+            step_number=2,
+            max_steps=10,
+            structured_entry_commit_feedback=True,
+        ),
+        "normalized_1000",
+    )
+
+    assert "Previous structured entry may still have its final field" in prompt
+    assert "did not end with an explicit cell or row commit" in prompt
+    assert "Verify or commit the final field before finishing" in prompt
+    recovery = prompt.split("Recovery feedback:", 1)[1].split(
+        "Current perception:",
+        1,
+    )[0]
+    for forbidden in ("Enter", "Tab", "Excel", "C4", "M01"):
+        assert forbidden not in recovery
+
+
 def test_compose_action_prompt_validates_public_inputs() -> None:
     """Prompt 公共拼装边界拒绝无效任务、状态和坐标模式。"""
     valid = ActionPromptState(step_number=1, max_steps=10)
@@ -124,12 +189,14 @@ def test_compose_action_prompt_validates_public_inputs() -> None:
 
 
 def test_prd_baseline_remains_separate_from_production_optimization() -> None:
-    """PRD 原文保留用于审计；production 顶部为统一 8 动作协议。"""
+    """PRD 原文保留用于审计；production 顶部仍限定同一五动作集合。"""
     assert "每次只输出一个动作" in PRD_ACTION_SYSTEM_PROMPT
     assert not ACTION_SYSTEM_PROMPT.startswith(PRD_ACTION_SYSTEM_PROMPT)
-    assert "right_click(x=<整数>, y=<整数>)" in ACTION_SYSTEM_PROMPT
-    assert "double_click(x=<整数>, y=<整数>)" in ACTION_SYSTEM_PROMPT
-    assert "drag(x1=<整数>, y1=<整数>, x2=<整数>, y2=<整数>)" in ACTION_SYSTEM_PROMPT
+    grammar_section = ACTION_SYSTEM_PROMPT.split("输出协议：", 1)[0]
+    for action in ("click(", "type(", "scroll(", "hotkey(", "finish("):
+        assert action in grammar_section
+    for unsupported in ("right_click(", "double_click(", "drag("):
+        assert unsupported not in grammar_section
 
 
 def test_finish_works_without_scope() -> None:
@@ -208,7 +275,7 @@ def test_perception_to_agent_prompt_and_image_passed() -> None:
             self._response = response
             self.calls = 0
 
-        def generate(self, image, prompt, mode="local"):
+        def generate(self, image, prompt, mode="local", options=None):
             self.calls += 1
             captured.append((image, prompt, mode))
             return self._response
@@ -388,3 +455,199 @@ def test_windows_zorder_flows_into_prompt(
     assert "windows(按层叠顺序自顶向下, bbox为相对坐标):" in prompt
     assert "id:1 fg=true process=cmd.exe" in prompt
     assert "outside.exe" not in prompt
+
+
+class _ZoomAwareFakeRecognizer:
+    """按图像尺寸区分全图/放大遍:返回不同识别结果。"""
+
+    def __init__(self, full_items, zoom_items):
+        self._full = full_items
+        self._zoom = zoom_items
+        self.calls: list[tuple[int, int]] = []
+
+    def recognize(self, image):
+        self.calls.append(image.size)
+        if image.size == (200, 100):
+            return self._full
+        return self._zoom
+
+
+def _item(text, bbox, confidence=0.9):
+    return {"text": text, "bbox": bbox, "confidence": confidence}
+
+
+def test_perceive_ocr_elements_focus_pass_takes_priority() -> None:
+    """焦点放大遍的结果优先进入配额,并正确映射回全图坐标。"""
+    from perception.prompt_context import perceive_ocr_elements
+
+    full = [
+        _item("功能区甲", (0, 0, 100, 20)),
+        _item("功能区乙", (0, 25, 100, 45)),
+        _item("功能区丙", (0, 50, 100, 70)),
+    ]
+    # 放大遍(以(100,50)为中心的裁剪,原点约(0,0),2x):识别出单元格
+    zoom = [
+        _item("姓名", (80, 60, 200, 100)),
+        _item("部门", (280, 60, 400, 100)),
+    ]
+    recognizer = _ZoomAwareFakeRecognizer(full, zoom)
+    elements = perceive_ocr_elements(
+        recognizer,
+        Image.new("RGB", (200, 100)),
+        focus_point=(100, 50),
+    )
+    texts = [e.split('text="')[1].split('"')[0] for e in elements]
+    # 焦点结果排最前,全图结果补足
+    assert texts[:2] == ["姓名", "部门"]
+    assert "功能区甲" in texts
+    # 两次识别都被调用(全图 + 放大)
+    assert len(recognizer.calls) == 2
+
+
+def test_perceive_ocr_elements_focus_outside_image_skips_zoom() -> None:
+    """焦点不在截图内时只做全图识别,行为与旧版一致。"""
+    from perception.prompt_context import perceive_ocr_elements
+
+    full = [_item("唯一文字", (10, 10, 60, 40))]
+    recognizer = _ZoomAwareFakeRecognizer(full, [])
+    elements = perceive_ocr_elements(
+        recognizer,
+        Image.new("RGB", (200, 100)),
+        focus_point=(500, 500),
+    )
+    assert len(elements) == 1
+    assert recognizer.calls == [(200, 100)]
+
+
+def test_perceive_ocr_elements_without_focus_single_pass() -> None:
+    """无焦点时只做一次全图识别,不触发放大裁剪遍。"""
+    from perception.prompt_context import perceive_ocr_elements_detailed
+
+    full = [_item("标题", (10, 10, 120, 40)), _item("按钮", (10, 60, 80, 90))]
+    recognizer = _ZoomAwareFakeRecognizer(full, [])
+    elements, detailed = perceive_ocr_elements_detailed(
+        recognizer,
+        Image.new("RGB", (200, 100)),
+        focus_point=None,
+    )
+    assert recognizer.calls == [(200, 100)]
+    assert len(elements) == 2
+    assert [d["text"] for d in detailed] == ["标题", "按钮"]
+
+
+def test_perceive_ocr_elements_detailed_matches_prompt_lines() -> None:
+    """结构化条目与 Prompt 行的文本/归一化 bbox/置信度逐项一致。"""
+    from perception.prompt_context import perceive_ocr_elements_detailed
+
+    full = [_item("甲", (0, 0, 100, 50)), _item("乙", (100, 50, 200, 100), 0.85)]
+    zoom = [_item("丙", (20, 20, 60, 40))]
+    recognizer = _ZoomAwareFakeRecognizer(full, zoom)
+    elements, detailed = perceive_ocr_elements_detailed(
+        recognizer,
+        Image.new("RGB", (200, 100)),
+        focus_point=(50, 25),
+    )
+    assert len(elements) == len(detailed)
+    for line, entry in zip(elements, detailed):
+        assert f'text="{entry["text"]}"' in line
+        assert f"bbox={entry['bbox']}" in line
+        assert f"confidence={entry['confidence']:.2f}" in line
+
+
+def test_perceive_ocr_elements_dense_focus_region_skips_zoom() -> None:
+    """焦点区域已有足量高置信结果时跳过二遍识别,直接复用全图结果。"""
+    from perception.prompt_context import FOCUS_REUSE_DENSE_MIN, perceive_ocr_elements
+
+    full = [
+        _item(f"条目{index}", (10, 10 + index * 10, 90, 20 + index * 10))
+        for index in range(FOCUS_REUSE_DENSE_MIN)
+    ]
+    recognizer = _ZoomAwareFakeRecognizer(
+        full, [_item("放大区文字", (80, 80, 120, 90))]
+    )
+    elements = perceive_ocr_elements(
+        recognizer,
+        Image.new("RGB", (200, 100)),
+        focus_point=(100, 50),
+    )
+    assert recognizer.calls == [(200, 100)]
+    assert all(f"条目{index}" in "\n".join(elements) for index in range(len(full)))
+
+
+def test_perceive_ocr_elements_focus_density_boundary_keeps_zoom() -> None:
+    """高置信条目数不足阈值或置信度不达标时,放大二遍识别仍然执行。"""
+    from perception.prompt_context import FOCUS_REUSE_DENSE_MIN, perceive_ocr_elements
+
+    sparse = [
+        _item(f"条目{index}", (10, 10 + index * 10, 90, 20 + index * 10))
+        for index in range(FOCUS_REUSE_DENSE_MIN - 1)
+    ]
+    recognizer = _ZoomAwareFakeRecognizer(
+        sparse, [_item("放大区文字", (80, 80, 120, 90))]
+    )
+    elements = perceive_ocr_elements(
+        recognizer,
+        Image.new("RGB", (200, 100)),
+        focus_point=(100, 50),
+    )
+    assert recognizer.calls == [(200, 100), (400, 200)]
+    assert 'text="放大区文字"' in elements[0]
+
+    low_confidence = [
+        _item(f"条目{index}", (10, 10 + index * 10, 90, 20 + index * 10), 0.7)
+        for index in range(FOCUS_REUSE_DENSE_MIN)
+    ]
+    recognizer_low = _ZoomAwareFakeRecognizer(
+        low_confidence,
+        [_item("放大区文字", (80, 80, 120, 90))],
+    )
+    perceive_ocr_elements(
+        recognizer_low,
+        Image.new("RGB", (200, 100)),
+        focus_point=(100, 50),
+    )
+    assert recognizer_low.calls == [(200, 100), (400, 200)]
+
+
+def test_perceive_ocr_elements_dedup_between_passes() -> None:
+    """两遍都识别到的同位置同文本只保留一份。"""
+    from perception.prompt_context import perceive_ocr_elements
+
+    full = [_item("重复词", (95, 45, 105, 55))]
+    zoom = [_item("重复词", (196, 96, 204, 104))]  # 映射回(98,48)-(102,52)
+    recognizer = _ZoomAwareFakeRecognizer(full, zoom)
+    elements = perceive_ocr_elements(
+        recognizer,
+        Image.new("RGB", (200, 100)),
+        focus_point=(100, 50),
+    )
+    dup_count = sum('text="重复词"' in e for e in elements)
+    assert dup_count == 1
+
+
+def test_action_screen_point_mapping() -> None:
+    """带坐标动作的屏幕锚点换算:相对坐标按截图尺寸缩放并叠加原点。"""
+    from agent.gui_agent import _action_screen_point, _focus_local_point
+
+    click = {"action_type": "click", "params": {"x": 500, "y": 500}}
+    point = _action_screen_point(
+        click,
+        (1000, 500),
+        (100, 200),
+        "normalized_1000",
+    )
+    assert point == (100 + round(500 * 999 / 1000), 200 + round(500 * 499 / 1000))
+    drag = {
+        "action_type": "drag",
+        "params": {"x1": 0, "y1": 0, "x2": 100, "y2": 100},
+    }
+    assert _action_screen_point(
+        drag,
+        (1000, 500),
+        (0, 0),
+        "normalized_1000",
+    ) == (round(100 * 999 / 1000), round(100 * 499 / 1000))
+    hotkey = {"action_type": "hotkey", "params": {"keys": ("enter",)}}
+    assert _action_screen_point(hotkey, (1000, 500), (0, 0), "normalized_1000") is None
+    assert _focus_local_point(None, (0, 0)) is None
+    assert _focus_local_point((150, 260), (100, 200)) == (50, 60)

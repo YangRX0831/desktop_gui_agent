@@ -13,12 +13,11 @@
     + 4-bit 量化加载；模型权重位于仓库外，构造阶段只验证路径，权在首次
     generate 延迟加载。历史 OpenVINO 实现已不再作为 production baseline。
 
-fallback 授权约束（AGENTS §11.2）:
-    PRD 4.3.1 的 ``模型加载失败时自动切换到 API 模式`` 仅作为 local 模式下
-    model-load-failure -> API fallback capability 保留。真正发送 screenshot/
-    prompt 到远程 API 前，必须同时满足 ``fallback_enabled`` 和当前 run 的
-    ``fallback_authorized``；触发范围仅限 ``LocalModelLoadError``，不得把任意
-    本地推理异常扩大为 fallback trigger。
+fallback 行为（PRD 4.3.1）:
+    PRD 4.3.1 规定 local 模式下模型加载失败时自动切换到 API 模式;本模块
+    据此在 ``LocalModelLoadError`` 时自动调用 API 后端,前提是构造时
+    ``fallback_enabled`` 为 True。触发范围仅限 ``LocalModelLoadError``,
+    不把任意本地推理异常扩大为 fallback trigger。
 
 隐私与异常:
     图像和 prompt 仅传给显式选择的后端。日志只包含固定事件、异常类型和
@@ -27,6 +26,7 @@ fallback 授权约束（AGENTS §11.2）:
 
 import importlib
 import logging
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal, Protocol
 
@@ -237,9 +237,13 @@ class Qwen2VLLocalBackend:
             chat_template = getattr(processor, "apply_chat_template", None)
             if chat_template is None:
                 raise ValueError("processor 缺少 apply_chat_template。")
-            text = chat_template(messages, tokenize=False, add_generation_prompt=True)
+            text = chat_template(
+                messages,
+                tokenize=False,
+                add_generation_prompt=True,
+            )
             rgb_image = image.convert("RGB")
-            batch = processor(
+            batch = processor(  # type: ignore[operator]  # Transformers 动态属性
                 text=[text],
                 images=[rgb_image],
                 padding=True,
@@ -256,12 +260,14 @@ class Qwen2VLLocalBackend:
                 "max_new_tokens": self._max_new_tokens,
                 "do_sample": False,
             }
-            output_ids = model.generate(**batch, **generate_kwargs)
+            output_ids = model.generate(  # type: ignore[attr-defined, arg-type]
+                **batch, **generate_kwargs
+            )
         except Exception as exception:
             raise LocalModelInferenceError(_LOCAL_INFERENCE_MESSAGE) from exception
         try:
-            generated = output_ids[:, batch["input_ids"].shape[1] :]
-            # type: ignore[index]  # Transformers 返回 Tensor，但本后端不依赖其类型存根。
+            ids_len = batch["input_ids"].shape[1]  # type: ignore[index]  # Tensor 无存根
+            generated = output_ids[:, ids_len:]
             processor = self._processor
             if processor is None:
                 raise LocalModelOutputError(_LOCAL_OUTPUT_MESSAGE)
@@ -305,19 +311,31 @@ class Qwen2VLLocalBackend:
         return self._generate_text(model, batch)
 
 
+@dataclass(frozen=True)
+class ModelCallOptions:
+    """一次模型调用的分层消息协议可选请求配置。
+
+    对应旧 ``call_extra`` 事实承担的三个可选透传字段;None 表示
+    不发送该字段(保持 V1 单消息合同)。
+    """
+
+    system_prompt: str | None = None
+    temperature: float | None = None
+    usage_out: dict[str, object] | None = None
+
+
 class ModelClient:
     """统一执行本地模型调用、API 回退和有限 API 重试。
 
     Attributes:
         local_backend: 首选的本地模型实现，仅在 local 模式调用。
-        api_backend: 显式 API 模式或批准 fallback 时使用的实现。
-        fallback_enabled: 是否保留 PRD model-load-failure -> API capability。
+        api_backend: 显式 API 模式或 PRD 4.3.1 自动 fallback 时使用的实现。
+        fallback_enabled: 是否启用 PRD model-load-failure -> API capability。
         max_api_retries: 首次 API 失败后的最多重试次数。
 
-    fallback 授权是 run-scoped、non-persistent:每个 run 必须显式调用
-    ``set_run_fallback_authorization(True)`` 才允许 model-load-failure ->
-    API fallback;默认 deny。run 结束由 ``clear_run_fallback_authorization``
-    复位,下一 run 不继承上一 run 的授权。
+    fallback 按 PRD 4.3.1 自动触发:local 模式下 ``LocalModelLoadError``
+    且 ``fallback_enabled`` 为 True 时,无需任何 run 级授权即切换到
+    API 后端;其余本地异常不触发 fallback。
     """
 
     def __init__(
@@ -358,8 +376,6 @@ class ModelClient:
         self._local_backend = local_backend
         self._api_backend = resolved_api_backend
         self._fallback_enabled = fallback_enabled
-        # run-scoped fallback 授权;默认 deny,每 run 显式设置,不跨 run 继承。
-        self._run_fallback_authorized = False
         self._max_api_retries = max_api_retries
 
     @staticmethod
@@ -367,24 +383,6 @@ class ModelClient:
         """验证后端是否提供可调用的 generate。"""
         if not callable(getattr(backend, "generate", None)):
             raise TypeError(f"{name} 必须提供可调用的 generate。")
-
-    def set_run_fallback_authorization(self, authorized: bool) -> None:
-        """设置当前 run 的 API fallback 授权状态。
-
-        Args:
-            authorized: True 表示当前 run 显式授权 model-load-failure ->
-                API fallback;False 回到 deny-by-default。
-
-        每个 run 边界由调用方显式设置;run 结束应调用
-        ``clear_run_fallback_authorization`` 复位,防止下一 run 继承。
-        """
-        if type(authorized) is not bool:
-            raise TypeError("authorized 必须是 bool。")
-        self._run_fallback_authorized = authorized
-
-    def clear_run_fallback_authorization(self) -> None:
-        """run 结束后复位 fallback 授权,防止跨 run 继承。"""
-        self._run_fallback_authorized = False
 
     @staticmethod
     def _validate_generate_args(
@@ -412,18 +410,29 @@ class ModelClient:
         return response
 
     def _can_fallback(self, exception: Exception) -> bool:
-        """判断当前异常是否属于 PRD model-load-failure 且已获当前 run 授权。"""
+        """判断当前异常是否属于 PRD model-load-failure 且 capability 开启。"""
         if not isinstance(exception, LocalModelLoadError):
             return False
-        if not self._fallback_enabled:
-            return False
-        return self._run_fallback_authorized
+        return self._fallback_enabled
 
-    def _generate_from_api(self, image: Image.Image, prompt: str) -> str:
-        """执行首次 API 调用和次数有限的失败后重试。"""
+    def _generate_from_api(
+        self,
+        image: Image.Image,
+        prompt: str,
+        options: ModelCallOptions | None = None,
+    ) -> str:
+        """执行首次 API 调用和次数有限的失败后重试;透传消息协议参数。"""
+        options = options or ModelCallOptions()
+        call_extra: dict[str, object] = {}
+        if options.system_prompt is not None:
+            call_extra["system_prompt"] = options.system_prompt
+        if options.temperature is not None:
+            call_extra["temperature"] = options.temperature
+        if options.usage_out is not None:
+            call_extra["usage_out"] = options.usage_out
         for attempt in range(1 + self._max_api_retries):
             try:
-                response = self._api_backend.generate(image, prompt)
+                response = self._api_backend.generate(image, prompt, **call_extra)
                 return self._require_text(response)
             except DashScopeAPIConfigurationError as exception:
                 log_safe_exception(logger, _API_FAILURE_EVENT, exception)
@@ -443,6 +452,7 @@ class ModelClient:
         image: Image.Image,
         prompt: str,
         mode: Literal["local", "api"] = "local",
+        options: ModelCallOptions | None = None,
     ) -> str:
         """调用选定后端并返回严格文本。
 
@@ -450,6 +460,8 @@ class ModelClient:
             image: 原样传给后端的 PIL 图像。
             prompt: 原样传给后端的非空提示词。
             mode: 首选调用模式。
+            options: 分层消息协议可选配置(system/temperature/usage);None 保持
+                V1 单消息合同。
 
         Returns:
             模型后端文本，或固定且脱敏的运行错误信息。
@@ -458,13 +470,13 @@ class ModelClient:
             TypeError: 公共参数类型错误。
             ValueError: 参数值不合法。
 
-        local 模式下，仅当本地模型 *load* 失败、fallback capability 保留
-        且当前 run 显式授权时，才把图像与 prompt 发送给远程 API；其余本地
+        local 模式下，仅当本地模型 *load* 失败且 ``fallback_enabled`` 为
+        True 时，按 PRD 4.3.1 自动把图像与 prompt 切换到远程 API；其余本地
         失败一律返回固定本地失败信息，不发送任何远程数据。
         """
         self._validate_generate_args(image, prompt, mode)
         if mode == "api":
-            return self._generate_from_api(image, prompt)
+            return self._generate_from_api(image, prompt, options)
 
         try:
             response = self._local_backend.generate(image, prompt)
@@ -472,5 +484,5 @@ class ModelClient:
         except Exception as exception:
             log_safe_exception(logger, _LOCAL_FAILURE_EVENT, exception)
             if self._can_fallback(exception):
-                return self._generate_from_api(image, prompt)
+                return self._generate_from_api(image, prompt, options)
             return _LOCAL_FAILURE_MESSAGE

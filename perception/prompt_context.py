@@ -15,28 +15,160 @@
 """
 
 import logging
-from typing import Protocol
+import re
+from typing import Literal, Protocol, cast
 
 from PIL import Image
 
 from perception.audio_state import get_master_volume_percent
 from perception.ocr_recognizer import OCRResult
 from perception.screenshot import (
+    FocusControlKindLiteral,
     get_focus_control_kind,
     get_foreground_app_hwnd,
     get_window_screen_rect,
     is_window_existing,
     list_visible_windows_zorder,
 )
+from utils.run_diagnostics import diag_log, diag_phase
 
 logger = logging.getLogger(__name__)
+
+# 键盘就绪三态;与 ActionPromptState.keyboard_input_ready 的取值合同一致。
+PromptReadinessLiteral = Literal["true", "false", "unknown"]
 
 # OCR 过滤:清晰屏幕文字的识别分数通常不低于 0.9,取 0.8 滤除阴影与
 # 抗锯齿噪声;元素上限控制 Prompt 长度并保留识别顺序。
 OCR_MIN_CONFIDENCE = 0.8
 OCR_MAX_ELEMENTS = 20
+# 焦点放大二遍识别:全图识别对界面内小字(表格单元格、表单字段)的
+# 检测率不足;对上一次动作位置附近区域裁剪放大后再识别一遍,结果
+# 优先进入元素配额,让模型能"看见"自己刚操作区域的文字反馈。
+FOCUS_REGION_HALF = (450, 300)
+FOCUS_ZOOM = 2
+FOCUS_DEDUP_DISTANCE = 40
+# 焦点区域复用阈值:全图结果在焦点裁剪区域内的高置信条目达到该数时
+# 视为"已有结果充足",跳过放大二遍识别。P5B 代表性 corpus 实测:密集
+# 场景下二遍只会把长行重切为碎片并挤占元素配额;稀疏场景保留二遍,
+# 用于补救全图检测对小字的偶发漏检。
+FOCUS_REUSE_DENSE_MIN = 6
 # Prompt 窗口感知上限:覆盖常见层叠场景并控制长度。
 MAX_WINDOWS_IN_PROMPT = 8
+
+# STRUCTURED GROUNDING LITE(PHASE 2B)候选上限与过滤阈值:OCR 文本
+# 候选只保留高置信短标签,窗口候选前台优先;Agent 自身窗口绝不入列。
+GROUNDING_MAX_OCR_CANDIDATES = 15
+GROUNDING_MAX_WINDOW_CANDIDATES = 5
+GROUNDING_MIN_CONFIDENCE = 0.9
+GROUNDING_MAX_TEXT_LENGTH = 12
+_OCR_ELEMENT_PATTERN = re.compile(
+    r'^text="(.*)" bbox=\((\d+), (\d+), (\d+), (\d+)\) confidence=([0-9.]+)$',
+)
+_WINDOW_LINE_PATTERN = re.compile(
+    r"^id:(\d+) fg=(true|false) process=(\S+) bbox=\((\d+), (\d+), (\d+), (\d+)\)$",
+)
+
+
+def build_grounding_candidates(
+    ocr_elements: tuple[str, ...],
+    windows: tuple[str, ...],
+    agent_ui_hwnd: int,
+) -> list[dict[str, object]]:
+    """把既有 OCR/窗口感知序列化行转成结构化 grounding 候选。
+
+    复用感知层已经产出并归一化到截图 0..1000 坐标的字符串,不重复
+    枚举或 OCR。窗口候选排除 Agent 自身控制窗口;OCR 候选过滤高置信
+    短文本并按置信度排序。
+    """
+    candidates: list[dict[str, object]] = []
+    window_rows: list[dict[str, object]] = []
+    for line in windows:
+        match = _WINDOW_LINE_PATTERN.match(line)
+        if match is None:
+            continue
+        hwnd = int(match.group(1))
+        if hwnd == agent_ui_hwnd:
+            continue
+        window_rows.append(
+            {
+                "source": "window",
+                "role": "window",
+                "name": match.group(3),
+                "bbox": (
+                    int(match.group(4)),
+                    int(match.group(5)),
+                    int(match.group(6)),
+                    int(match.group(7)),
+                ),
+                "fg": match.group(2) == "true",
+            },
+        )
+    window_rows.sort(key=lambda row: not row["fg"])
+    candidates.extend(window_rows[:GROUNDING_MAX_WINDOW_CANDIDATES])
+
+    ocr_rows: list[tuple[float, int, dict[str, object]]] = []
+    for index, line in enumerate(ocr_elements):
+        match = _OCR_ELEMENT_PATTERN.match(line)
+        if match is None:
+            continue
+        text = match.group(1)
+        confidence = float(match.group(6))
+        if confidence < GROUNDING_MIN_CONFIDENCE:
+            continue
+        if len(text) > GROUNDING_MAX_TEXT_LENGTH:
+            continue
+        ocr_rows.append(
+            (
+                confidence,
+                index,
+                {
+                    "source": "ocr",
+                    "role": "text",
+                    "text": text,
+                    "bbox": (
+                        int(match.group(2)),
+                        int(match.group(3)),
+                        int(match.group(4)),
+                        int(match.group(5)),
+                    ),
+                    "confidence": confidence,
+                },
+            ),
+        )
+    ocr_rows.sort(key=lambda item: (-item[0], item[1]))
+    candidates.extend(row[2] for row in ocr_rows[:GROUNDING_MAX_OCR_CANDIDATES])
+    return candidates
+
+
+def render_interactive_elements(
+    candidates: list[dict[str, object]],
+) -> tuple[str, ...]:
+    """把候选渲染为紧凑的机器可读元素行(E 编号 + 字段)。"""
+    lines = []
+    for index, candidate in enumerate(candidates, 1):
+        bbox = ",".join(
+            str(value) for value in cast(tuple[int, ...], candidate["bbox"])
+        )
+        if candidate["source"] == "window":
+            lines.append(
+                "E{index} source=window role=window name={name} fg={fg} "
+                "bbox=({bbox})".format(
+                    index=index,
+                    name=candidate["name"],
+                    fg="true" if candidate["fg"] else "false",
+                    bbox=bbox,
+                ),
+            )
+        else:
+            lines.append(
+                'E{index} source=ocr role=text text="{text}" '
+                "bbox=({bbox})".format(
+                    index=index,
+                    text=candidate["text"],
+                    bbox=bbox,
+                ),
+            )
+    return tuple(lines)
 
 
 class OCRRecognizerProtocol(Protocol):
@@ -53,52 +185,203 @@ class OCRRecognizerProtocol(Protocol):
 def perceive_ocr_elements(
     recognizer: OCRRecognizerProtocol | None,
     image: Image.Image,
+    focus_point: tuple[int, int] | None = None,
 ) -> tuple[str, ...]:
     """识别截图中可用于 Prompt 定位的文字元素。
 
     失败或未启用时返回空元组；文本压缩为单行，bbox 归一化为与 click
-    一致的 0..1000 相对坐标，按识别顺序保留前 ``OCR_MAX_ELEMENTS``
-    个高置信度元素。
+    一致的 0..1000 相对坐标。提供 ``focus_point``(当前截图内的像素
+    坐标,通常是上一次已分发动作的位置)时,先对该位置附近区域裁剪
+    放大做第二遍识别,其结果优先占用 ``OCR_MAX_ELEMENTS`` 配额,
+    其余名额按全图识别顺序补足;若全图结果已密集覆盖焦点区域,则
+    跳过二遍识别,直接复用全图结果。
+    """
+    return perceive_ocr_elements_detailed(
+        recognizer,
+        image,
+        focus_point,
+    )[0]
+
+
+def perceive_ocr_elements_detailed(
+    recognizer: OCRRecognizerProtocol | None,
+    image: Image.Image,
+    focus_point: tuple[int, int] | None = None,
+) -> tuple[tuple[str, ...], tuple[dict, ...]]:
+    """同 ``perceive_ocr_elements``,并同时返回结构化 OCR 条目。
+
+    第二个返回值为通过置信度/去重/配额过滤的 ``{"text", "bbox",
+    "confidence"}`` 字典元组,bbox 为与 Prompt 行一致的 0..1000 归一化
+    坐标。供完成检测等本地证据计算复用同一次识别结果,不产生第二次
+    OCR。recognizer 为 None 时返回 ((), ())。
     """
     if recognizer is None:
-        return ()
+        return (), ()
+    with diag_phase("diag_ocr"):
+        width, height = image.size
+        full_results = _recognize_quietly(recognizer, image)
+        focus_results: list[dict] = []
+        if focus_point is not None:
+            x, y = focus_point
+            if 0 <= x < width and 0 <= y < height:
+                if not _is_focus_region_dense(full_results, x, y):
+                    crop, origin_left, origin_top = _focus_crop(image, x, y)
+                    zoom_results = _recognize_quietly(recognizer, crop)
+                    focus_results = _map_crop_results(
+                        zoom_results,
+                        origin_left,
+                        origin_top,
+                    )
+        elements: list[str] = []
+        detailed: list[dict] = []
+        taken_centers: list[tuple[str, float, float]] = []
+        for item in focus_results + list(full_results):
+            confidence = item["confidence"]
+            if confidence < OCR_MIN_CONFIDENCE:
+                continue
+            text = " ".join(item["text"].split())
+            if not text:
+                continue
+            x1, y1, x2, y2 = item["bbox"]
+            center = ((x1 + x2) / 2, (y1 + y2) / 2)
+            if _is_duplicate(text, center, taken_centers):
+                continue
+            taken_centers.append((text, center[0], center[1]))
+            normalized = tuple(
+                min(1000, max(0, round(value * 1000 / span)))
+                for value, span in (
+                    (x1, width),
+                    (y1, height),
+                    (x2, width),
+                    (y2, height),
+                )
+            )
+            elements.append(
+                'text="{}" bbox=({}, {}, {}, {}) confidence={:.2f}'.format(
+                    text,
+                    *normalized,
+                    confidence,
+                ),
+            )
+            detailed.append(
+                {
+                    "text": text,
+                    "bbox": normalized,
+                    "confidence": confidence,
+                },
+            )
+            if len(elements) >= OCR_MAX_ELEMENTS:
+                break
+        diag_log(
+            "diag_ocr_stats",
+            image_w=width,
+            image_h=height,
+            elements=len(elements),
+        )
+        return tuple(elements), tuple(detailed)
+
+
+def _recognize_quietly(
+    recognizer: OCRRecognizerProtocol,
+    image: Image.Image,
+) -> list[dict]:
+    """执行一次识别;任何失败按无信息处理并记安全日志。"""
     try:
-        results = recognizer.recognize(image)
+        return [dict(result) for result in recognizer.recognize(image)]
     except Exception as exception:
         logger.warning(
             "prompt_context_ocr_failed：exception_type=%s",
             type(exception).__name__,
         )
-        return ()
-    width, height = image.size
-    elements: list[str] = []
+        return []
+
+
+def _is_focus_region_dense(
+    results: list[dict],
+    x: int,
+    y: int,
+) -> bool:
+    """判断全图结果是否已密集覆盖焦点裁剪区域。
+
+    区域内高置信条目数达到 ``FOCUS_REUSE_DENSE_MIN`` 时返回 True,
+    此时放大二遍识别不再补充新信息,调用方应直接复用全图结果。
+    """
+    half_w, half_h = FOCUS_REGION_HALF
+    left, top, right, bottom = x - half_w, y - half_h, x + half_w, y + half_h
+    count = 0
     for item in results:
-        confidence = item["confidence"]
-        if confidence < OCR_MIN_CONFIDENCE:
-            continue
-        text = " ".join(item["text"].split())
-        if not text:
+        if item["confidence"] < OCR_MIN_CONFIDENCE:
             continue
         x1, y1, x2, y2 = item["bbox"]
-        normalized = tuple(
-            min(1000, max(0, round(value * 1000 / span)))
-            for value, span in (
-                (x1, width),
-                (y1, height),
-                (x2, width),
-                (y2, height),
-            )
+        if x2 > left and x1 < right and y2 > top and y1 < bottom:
+            count += 1
+            if count >= FOCUS_REUSE_DENSE_MIN:
+                return True
+    return False
+
+
+def _focus_crop(
+    image: Image.Image,
+    x: int,
+    y: int,
+) -> tuple[Image.Image, int, int]:
+    """以焦点为中心裁剪固定半宽高的区域并放大,返回图与裁剪原点。
+
+    越界部分按图像边界收敛,原点用于把放大图上的 bbox 映射回全图。
+    """
+    width, height = image.size
+    half_w, half_h = FOCUS_REGION_HALF
+    left = max(0, x - half_w)
+    top = max(0, y - half_h)
+    right = min(width, x + half_w)
+    bottom = min(height, y + half_h)
+    crop = image.crop((left, top, right, bottom))
+    zoomed = crop.resize(
+        (crop.width * FOCUS_ZOOM, crop.height * FOCUS_ZOOM),
+        Image.Resampling.LANCZOS,
+    )
+    return zoomed, left, top
+
+
+def _map_crop_results(
+    zoom_results: list[dict],
+    origin_left: int,
+    origin_top: int,
+) -> list[dict]:
+    """把放大裁剪图上的识别 bbox 换算回全图像素坐标。
+
+    bbox 坐标除以放大倍数得到裁剪图坐标,再叠加裁剪原点。
+    """
+    mapped: list[dict] = []
+    for item in zoom_results:
+        x1, y1, x2, y2 = item["bbox"]
+        mapped.append(
+            {
+                "text": item["text"],
+                "bbox": (
+                    x1 / FOCUS_ZOOM + origin_left,
+                    y1 / FOCUS_ZOOM + origin_top,
+                    x2 / FOCUS_ZOOM + origin_left,
+                    y2 / FOCUS_ZOOM + origin_top,
+                ),
+                "confidence": item["confidence"],
+            },
         )
-        elements.append(
-            'text="{}" bbox=({}, {}, {}, {}) confidence={:.2f}'.format(
-                text,
-                *normalized,
-                confidence,
-            ),
-        )
-        if len(elements) >= OCR_MAX_ELEMENTS:
-            break
-    return tuple(elements)
+    return mapped
+
+
+def _is_duplicate(
+    text: str,
+    center: tuple[float, float],
+    taken: list[tuple[str, float, float]],
+) -> bool:
+    """同文本且中心距离过近视为同一元素(全图与放大遍的去重)。"""
+    return any(
+        earlier_text == text
+        and abs(earlier_x - center[0]) < FOCUS_DEDUP_DISTANCE
+        and abs(earlier_y - center[1]) < FOCUS_DEDUP_DISTANCE
+        for earlier_text, earlier_x, earlier_y in taken
+    )
 
 
 def perceive_windows(
@@ -115,7 +398,10 @@ def perceive_windows(
     for window in list_visible_windows_zorder():
         if len(entries) >= MAX_WINDOWS_IN_PROMPT:
             break
-        left, top, width, height = window["rect"]
+        left, top, width, height = cast(
+            tuple[int, int, int, int],
+            window["rect"],
+        )
         bbox = rect_to_viewport_bbox(
             (left, top, left + width, top + height),
             screenshot_size,
@@ -162,14 +448,15 @@ def rect_to_viewport_bbox(
         min(right, view_right),
         min(bottom, view_bottom),
     )
-    return tuple(
-        min(1000, max(0, round((value - origin) * 1000 / span)))
-        for value, origin, span in (
-            (clamped[0], view_left, screen_w),
-            (clamped[1], view_top, screen_h),
-            (clamped[2], view_left, screen_w),
-            (clamped[3], view_top, screen_h),
-        )
+
+    def _scale(value: int, origin: int, span: int) -> int:
+        return min(1000, max(0, round((value - origin) * 1000 / span)))
+
+    return (
+        _scale(clamped[0], view_left, screen_w),
+        _scale(clamped[1], view_top, screen_h),
+        _scale(clamped[2], view_left, screen_w),
+        _scale(clamped[3], view_top, screen_h),
     )
 
 
@@ -186,7 +473,7 @@ def task_target_window_state(
     if target is None:
         return "none"
     return serialize_bound_window(
-        int(target["hwnd"]),
+        int(cast(int, target["hwnd"])),
         str(target["process"]),
         screenshot_size,
         region_offset,
@@ -240,11 +527,11 @@ def serialize_bound_window(
 
 
 def keyboard_input_ready(
-    focus_kind: str,
+    focus_kind: FocusControlKindLiteral,
     protect_agent_ui: bool,
     agent_ui_hwnd: int,
     unlocked: bool,
-) -> str:
+) -> PromptReadinessLiteral:
     """判断当前是否可以安全直接 type。
 
     依据 GetGUIThreadInfo 的焦点控件类别；none 表示无前台输入焦点，
@@ -270,7 +557,7 @@ def system_volume_state() -> int | None:
     return get_master_volume_percent()
 
 
-def focus_control_state() -> str:
+def focus_control_state() -> FocusControlKindLiteral:
     """读取前台焦点控件类别供状态注入。"""
     return get_focus_control_kind()
 
@@ -290,4 +577,4 @@ def scale_image_for_model(
         return image
     ratio = max_dim_limit / longest
     new_size = (round(image.width * ratio), round(image.height * ratio))
-    return image.resize(new_size, Image.LANCZOS)
+    return image.resize(new_size, Image.Resampling.LANCZOS)

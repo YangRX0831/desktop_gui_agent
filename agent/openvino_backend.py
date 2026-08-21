@@ -21,6 +21,7 @@ from PIL import Image
 logger = logging.getLogger(__name__)
 
 _MAX_NEW_TOKENS = 256
+_VISION_PREFIX = "<|vision_start|><|image_pad|><|vision_end|>\n"
 
 
 class OpenVINOModelLoadError(RuntimeError):
@@ -133,9 +134,9 @@ class Qwen2VLOpenVINOBackend:
                 max_new_tokens=self._max_new_tokens,
                 do_sample=False,
             )
-            result = pipeline.generate(
-                prompt,
-                images=[tensor],
+            result = pipeline.generate(  # type: ignore[attr-defined]  # 动态导入
+                _VISION_PREFIX + prompt,
+                image=tensor,
                 generation_config=config,
             )
         except OpenVINOModelLoadError:

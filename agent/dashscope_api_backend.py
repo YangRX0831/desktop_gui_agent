@@ -26,6 +26,8 @@ from urllib.parse import urlparse
 
 from PIL import Image
 
+from utils.run_diagnostics import diag_log, diag_phase
+
 DASHSCOPE_CONFIGURATION_MESSAGE = "API 配置缺失或无效。"
 
 _API_KEY_ENV = "DASHSCOPE_API_KEY"
@@ -135,6 +137,9 @@ class DashScopeAPIBackend:
         *,
         endpoint: str = _DEFAULT_ENDPOINT,
         timeout_seconds: float = _DEFAULT_TIMEOUT_SECONDS,
+        enable_thinking: bool | None = None,
+        thinking_budget: int | None = None,
+        supports_thinking_options: bool = False,
         transport: HTTPTransport | None = None,
     ) -> None:
         """保存外部 API 配置并验证基础参数，不发送网络请求。
@@ -144,6 +149,9 @@ class DashScopeAPIBackend:
             model: 模型名称，可省略。
             endpoint: 兼容接口端点地址。
             timeout_seconds: 单次请求超时秒数。
+            enable_thinking: thinking 三态覆盖;None 表示不发送。
+            thinking_budget: 可选正整数 token budget。
+            supports_thinking_options: provider 是否支持 thinking 字段。
             transport: 可注入的同步 HTTP transport；省略时使用 requests。
 
         Raises:
@@ -165,6 +173,15 @@ class DashScopeAPIBackend:
             raise TypeError("timeout_seconds 必须是数值。")
         if not 0 < float(timeout_seconds) <= _MAX_TIMEOUT_SECONDS:
             raise ValueError("timeout_seconds 必须在 0 到 120 之间。")
+        if enable_thinking is not None and type(enable_thinking) is not bool:
+            raise TypeError("enable_thinking 必须是 bool 或 None。")
+        if thinking_budget is not None:
+            if type(thinking_budget) is not int:
+                raise TypeError("thinking_budget 必须是 int 或 None。")
+            if thinking_budget <= 0:
+                raise ValueError("thinking_budget 必须大于 0。")
+        if type(supports_thinking_options) is not bool:
+            raise TypeError("supports_thinking_options 必须是 bool。")
         if transport is not None and not callable(
             getattr(transport, "post", None),
         ):
@@ -174,17 +191,28 @@ class DashScopeAPIBackend:
         self._model = model.strip() if model is not None else None
         self._endpoint = endpoint.strip()
         self._timeout_seconds = float(timeout_seconds)
+        self._enable_thinking = enable_thinking
+        self._thinking_budget = thinking_budget
+        self._supports_thinking_options = supports_thinking_options
         self._transport = transport
 
     @classmethod
     def from_env(
         cls,
         *,
+        model: str | None = None,
+        enable_thinking: bool | None = None,
+        thinking_budget: int | None = None,
+        supports_thinking_options: bool = False,
         transport: HTTPTransport | None = None,
     ) -> "DashScopeAPIBackend":
         """从环境变量创建后端，不读取配置文件或持久化秘密。
 
         Args:
+            model: 配置层提供的模型名;None 时兼容读取既有模型环境变量。
+            enable_thinking: 配置层提供的 thinking 三态覆盖。
+            thinking_budget: 配置层提供的可选 thinking budget。
+            supports_thinking_options: provider capability 配置。
             transport: 可注入的同步 HTTP transport；省略时使用 requests。
 
         Returns:
@@ -208,9 +236,12 @@ class DashScopeAPIBackend:
         try:
             return cls(
                 os.environ.get(_API_KEY_ENV),
-                os.environ.get(_MODEL_ENV),
+                model if model is not None else os.environ.get(_MODEL_ENV),
                 endpoint=os.environ.get(_ENDPOINT_ENV, _DEFAULT_ENDPOINT),
                 timeout_seconds=timeout_seconds,
+                enable_thinking=enable_thinking,
+                thinking_budget=thinking_budget,
+                supports_thinking_options=supports_thinking_options,
                 transport=transport,
             )
         except (TypeError, ValueError) as exception:
@@ -266,24 +297,56 @@ class DashScopeAPIBackend:
         encoded = base64.b64encode(buffer.getvalue()).decode("ascii")
         return f"data:image/png;base64,{encoded}"
 
-    def _payload(self, image: Image.Image, prompt: str) -> dict[str, object]:
-        """构造单轮图像与文本消息，保持现有完整 prompt 不变。"""
-        return {
-            "model": self._model,
-            "messages": [
+    def _payload(
+        self,
+        image: Image.Image,
+        prompt: str,
+        system_prompt: str | None = None,
+        temperature: float | None = None,
+    ) -> dict[str, object]:
+        """构造单轮消息;分层协议使用 system/user 消息,文本先于图像。
+
+        system_prompt 为 None 时保持 V1 合同:单 user 消息、图像在前、
+        无采样参数,确保 V1 A/B 基线逐字节不变。
+        """
+        if system_prompt is None:
+            user_content: list[dict[str, object]] = [
+                {
+                    "type": "image_url",
+                    "image_url": {"url": self._image_data_url(image)},
+                },
+                {"type": "text", "text": prompt},
+            ]
+            messages: list[dict[str, object]] = [
+                {"role": "user", "content": user_content},
+            ]
+        else:
+            messages = [
+                {"role": "system", "content": system_prompt},
                 {
                     "role": "user",
                     "content": [
+                        {"type": "text", "text": prompt},
                         {
                             "type": "image_url",
                             "image_url": {"url": self._image_data_url(image)},
                         },
-                        {"type": "text", "text": prompt},
                     ],
                 },
-            ],
+            ]
+        payload: dict[str, object] = {
+            "model": self._model,
+            "messages": messages,
             "stream": False,
         }
+        if temperature is not None:
+            payload["temperature"] = temperature
+        if self._supports_thinking_options:
+            if self._enable_thinking is not None:
+                payload["enable_thinking"] = self._enable_thinking
+            if self._thinking_budget is not None:
+                payload["thinking_budget"] = self._thinking_budget
+        return payload
 
     @staticmethod
     def _extract_text(payload: object) -> str:
@@ -342,21 +405,37 @@ class DashScopeAPIBackend:
         transport = self._transport
         if transport is None:
             try:
-                transport = importlib.import_module("requests")
+                requests_module = importlib.import_module("requests")
+                session_factory = getattr(requests_module, "Session", None)
+                if not callable(session_factory):
+                    raise TypeError("requests Session unavailable")
+                transport = session_factory()
+                self._transport = transport
             except Exception as exception:
                 raise DashScopeAPINonRetryableError(
                     "API transport 不可用。",
                 ) from exception
         try:
-            response = transport.post(
-                self._endpoint,
-                headers={
-                    "Authorization": f"Bearer {self._api_key}",
-                    "Content-Type": "application/json",
-                },
-                json=payload,
-                timeout=self._timeout_seconds,
-                allow_redirects=False,
+            # OBSERVABILITY_ONLY:模型调用边界计时;挂起时表现为
+            # diag_model_begin 出现而 diag_model_end 缺失(in-flight)。
+            with diag_phase(
+                "diag_model",
+                model=self._model,
+                timeout_seconds=self._timeout_seconds,
+            ):
+                response = transport.post(
+                    self._endpoint,
+                    headers={
+                        "Authorization": f"Bearer {self._api_key}",
+                        "Content-Type": "application/json",
+                    },
+                    json=payload,
+                    timeout=self._timeout_seconds,
+                    allow_redirects=False,
+                )
+            diag_log(
+                "diag_model_response",
+                status_category=(str(getattr(response, "status_code", "?"))[:1] + "xx"),
             )
         except Exception as exception:
             error_type = (
@@ -367,12 +446,22 @@ class DashScopeAPIBackend:
             raise error_type("API transport 调用失败。") from exception
         return response
 
-    def generate(self, image: Image.Image, prompt: str) -> str:
+    def generate(
+        self,
+        image: Image.Image,
+        prompt: str,
+        system_prompt: str | None = None,
+        temperature: float | None = None,
+        usage_out: dict[str, object] | None = None,
+    ) -> str:
         """执行一次通义千问开放平台请求并返回统一文本。
 
         Args:
             image: 待发送的 PIL 图像。
             prompt: 非空提示词文本。
+            system_prompt: 分层协议的固定 system 文本;None 表示 V1 单消息。
+            temperature: 分层协议显式采样温度;None 表示不发送该参数。
+            usage_out: 可选字典;API 响应含 usage 时原样填入,不含时不写入。
 
         Returns:
             API 返回的非空文本。
@@ -390,7 +479,9 @@ class DashScopeAPIBackend:
         """
         self._validate_generate_args(image, prompt)
         self._validate_configuration()
-        response = self._post(self._payload(image, prompt))
+        response = self._post(
+            self._payload(image, prompt, system_prompt, temperature),
+        )
         status_code = getattr(response, "status_code", None)
         if status_code in _RETRYABLE_HTTP_STATUS:
             raise DashScopeAPIRetryableError("API 暂时不可用。")
@@ -402,4 +493,24 @@ class DashScopeAPIBackend:
             raise DashScopeAPINonRetryableError(
                 "API 响应格式无效。",
             ) from exception
+        if usage_out is not None and isinstance(payload, dict):
+            usage = payload.get("usage")
+            if isinstance(usage, dict):
+                # 兼容 input_tokens 与 prompt_tokens 两种键名,统一为
+                # input/output/cached 供 trace 使用,不估算缺失项。
+                usage_out.update(usage)
+                details = usage.get("prompt_tokens_details")
+                usage_out["input_tokens"] = usage.get(
+                    "input_tokens",
+                    usage.get("prompt_tokens", "unknown"),
+                )
+                usage_out["output_tokens"] = usage.get(
+                    "output_tokens",
+                    usage.get("completion_tokens", "unknown"),
+                )
+                usage_out["cached_tokens"] = (
+                    details.get("cached_tokens", "unknown")
+                    if isinstance(details, dict)
+                    else usage.get("cached_tokens", "unknown")
+                )
         return self._extract_text(payload)

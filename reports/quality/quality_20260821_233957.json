@@ -1,0 +1,142 @@
+{
+  "generated_at": "2026-08-21T23:39:57.814294+08:00",
+  "python": "3.10.20 | packaged by Anaconda, Inc. | (main, Jun 11 2026, 15:13:20) [MSC v.1942 64 bit (AMD64)]",
+  "platform": "Windows-10-10.0.26200-SP0",
+  "git_head": "c12bf3d3e5d0a4b953e6e0b957fc51f5d49a8efe",
+  "git_dirty": true,
+  "overall": "PASS",
+  "checks": [
+    {
+      "name": "pytest-tests",
+      "category": "unit",
+      "command": [
+        "C:\\Code\\Anaconda\\envs\\gui_agent\\python.exe",
+        "-B",
+        "-m",
+        "pytest",
+        "tests",
+        "-q",
+        "-p",
+        "no:cacheprovider"
+      ],
+      "exit_code": 0,
+      "output": "........................................................................ [  7%]\n........................................................................ [ 15%]\n........................................................................ [ 23%]\n........................................................................ [ 30%]\n........................................................................ [ 38%]\n........................................................................ [ 46%]\n........................................................................ [ 53%]\n........................................................................ [ 61%]\n........................................................................ [ 69%]\n........................................................................ [ 77%]\n........................................................................ [ 84%]\n........................................................................ [ 92%]\n......................................................................   [100%]\n934 passed in 19.75s"
+    },
+    {
+      "name": "pytest-benchmark-self-tests",
+      "category": "unit",
+      "command": [
+        "C:\\Code\\Anaconda\\envs\\gui_agent\\python.exe",
+        "-B",
+        "-m",
+        "pytest",
+        "benchmark",
+        "-q",
+        "-p",
+        "no:cacheprovider"
+      ],
+      "exit_code": 0,
+      "output": "........................................................................ [ 90%]\n........                                                                 [100%]\n80 passed in 2.46s"
+    },
+    {
+      "name": "mypy-production",
+      "category": "quality",
+      "command": [
+        "C:\\Code\\Anaconda\\envs\\gui_agent\\python.exe",
+        "-m",
+        "mypy",
+        "--ignore-missing-imports",
+        "config.py",
+        "main.py",
+        "verify_env.py",
+        "agent",
+        "perception",
+        "control",
+        "utils"
+      ],
+      "exit_code": 0,
+      "output": "Success: no issues found in 37 source files"
+    },
+    {
+      "name": "black",
+      "category": "quality",
+      "command": [
+        "C:\\Code\\Anaconda\\envs\\gui_agent\\python.exe",
+        "-m",
+        "black",
+        "--check",
+        "agent",
+        "perception",
+        "control",
+        "utils",
+        "tools",
+        "main.py",
+        "config.py",
+        "verify_env.py",
+        "tests",
+        "benchmark"
+      ],
+      "exit_code": 0,
+      "output": "All done! ✨ 🍰 ✨\n83 files would be left unchanged."
+    },
+    {
+      "name": "isort",
+      "category": "quality",
+      "command": [
+        "C:\\Code\\Anaconda\\envs\\gui_agent\\python.exe",
+        "-m",
+        "isort",
+        "--check-only",
+        "--profile",
+        "black",
+        "agent",
+        "perception",
+        "control",
+        "utils",
+        "tools",
+        "main.py",
+        "config.py",
+        "verify_env.py",
+        "tests",
+        "benchmark"
+      ],
+      "exit_code": 0,
+      "output": ""
+    },
+    {
+      "name": "flake8",
+      "category": "quality",
+      "command": [
+        "C:\\Code\\Anaconda\\envs\\gui_agent\\python.exe",
+        "-m",
+        "flake8",
+        "--max-line-length=88",
+        "--extend-ignore=E203,W503",
+        "agent",
+        "perception",
+        "control",
+        "utils",
+        "tools",
+        "main.py",
+        "config.py",
+        "verify_env.py",
+        "tests",
+        "benchmark"
+      ],
+      "exit_code": 0,
+      "output": ""
+    },
+    {
+      "name": "git-diff-check",
+      "category": "quality",
+      "command": [
+        "git",
+        "diff",
+        "--check"
+      ],
+      "exit_code": 0,
+      "output": "warning: in the working copy of 'README.md', LF will be replaced by CRLF the next time Git touches it\nwarning: in the working copy of 'agent/action_dispatcher.py', LF will be replaced by CRLF the next time Git touches it\nwarning: in the working copy of 'agent/action_parser.py', LF will be replaced by CRLF the next time Git touches it\nwarning: in the working copy of 'agent/dashscope_api_backend.py', LF will be replaced by CRLF the next time Git touches it\nwarning: in the working copy of 'agent/gui_agent.py', LF will be replaced by CRLF the next time Git touches it\nwarning: in the working copy of 'agent/model_client.py', LF will be replaced by CRLF the next time Git touches it\nwarning: in the working copy of 'agent/openvino_backend.py', LF will be replaced by CRLF the next time Git touches it\nwarning: in the working copy of 'agent/task_manager.py', LF will be replaced by CRLF the next time Git touches it\nwarning: in the working copy of 'config.py', LF will be replaced by CRLF the next time Git touches it\nwarning: in the working copy of 'main.py', LF will be replaced by CRLF the next time Git touches it\nwarning: in the working copy of 'perception/audio_state.py', LF will be replaced by CRLF the next time Git touches it\nwarning: in the working copy of 'perception/ocr_recognizer.py', LF will be replaced by CRLF the next time Git touches it\nwarning: in the working copy of 'perception/prompt_context.py', LF will be replaced by CRLF the next time Git touches it\nwarning: in the working copy of 'perception/screenshot.py', LF will be replaced by CRLF the next time Git touches it\nwarning: in the working copy of 'perception/ui_locator.py', LF will be replaced by CRLF the next time Git touches it\nwarning: in the working copy of 'requirements.txt', LF will be replaced by CRLF the next time Git touches it\nwarning: in the working copy of 'tests/agent_test_support.py', LF will be replaced by CRLF the next time Git touches it\nwarning: in the working copy of 'tests/test_agent_loop.py', LF will be replaced by CRLF the next time Git touches it\nwarning: in the working copy of 'tests/test_agent_parser.py', LF will be replaced by CRLF the next time Git touches it\nwarning: in the working copy of 'tests/test_agent_prompt.py', LF will be replaced by CRLF the next time Git touches it\nwarning: in the working copy of 'tests/test_agent_safety.py', LF will be replaced by CRLF the next time Git touches it\nwarning: in the working copy of 'tests/test_control.py', LF will be replaced by CRLF the next time Git touches it\nwarning: in the working copy of 'tests/test_perception.py', LF will be replaced by CRLF the next time Git touches it"
+    }
+  ],
+  "scope_note": "Non-GUI checks only; no targeted or official task is executed."
+}

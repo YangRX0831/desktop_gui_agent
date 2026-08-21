@@ -1,6 +1,8 @@
 """production wiring、配置与 API transport 测试。"""
 
 import asyncio
+import sys
+from types import SimpleNamespace
 
 import pytest
 from agentscope.message import Msg
@@ -23,20 +25,11 @@ from tests.agent_test_support import (
 )
 
 
-@pytest.mark.parametrize(
-    "response",
-    [
-        "API 模型调用失败。",
-        "API 配置缺失或无效。",
-    ],
-)
-def test_terminal_api_failure_does_not_restart_retry_budget(
-    response: str,
-) -> None:
-    """ModelClient 已终止的 API 失败不在 Agent 层重复重试。"""
+def test_config_failure_terminates_task_without_retry_budget_restart() -> None:
+    """配置缺失属不可重试不变式:立即终态,不消耗 max_steps(C3)。"""
     from agent.task_manager import TaskManager, TaskStatus
 
-    backend = SequenceBackend([response, 'Action: finish(result="x")'])
+    backend = SequenceBackend(["API 配置缺失或无效。", 'Action: finish(result="x")'])
     controls = MemoryControls()
     manager = TaskManager("任务")
     result = asyncio.run(
@@ -50,6 +43,28 @@ def test_terminal_api_failure_does_not_restart_retry_budget(
     assert backend.calls == 1
 
 
+def test_api_retry_exhaustion_continues_next_step() -> None:
+    """PRD 4.5.1:API 重试耗尽记录错误并继续下一步,不立即 fail(C1)。"""
+    from agent.task_manager import TaskManager, TaskStatus
+
+    backend = SequenceBackend(["API 模型调用失败。", 'Action: finish(result="x")'])
+    controls = MemoryControls()
+    manager = TaskManager("任务")
+    result = asyncio.run(
+        make_agent(backend, controls, manager, retry_count=3)(
+            Msg("u", "任务", "user"),
+        ),
+    )
+
+    # step1 记录模型失败后前进;step2 重新感知并成功 finish。
+    assert result.content == "x"
+    assert manager.state.status is TaskStatus.SUCCESS
+    assert backend.calls == 2
+    step1 = manager.state.steps[0]
+    assert step1.result is False
+    assert step1.attempts[0].stage == "model"
+
+
 def test_config_defaults_match_prd() -> None:
     """AppConfig 默认值与 PRD 4.4.1 一致。"""
     c = AppConfig()
@@ -57,6 +72,10 @@ def test_config_defaults_match_prd() -> None:
     assert c.retry_count == 3
     assert c.model_mode == "local"
     assert c.coordinate_mode == "normalized_1000"
+    assert c.api_model is None
+    assert c.api_enable_thinking is False
+    assert c.api_thinking_budget is None
+    assert c.api_thinking_options_supported is True
 
 
 def test_config_rejects_invalid_max_steps() -> None:
@@ -153,6 +172,49 @@ def test_config_bool_rejected_for_int_fields() -> None:
         AppConfig(retry_count=False)
 
 
+def test_config_rejects_invalid_api_runtime_options() -> None:
+    """API runtime options 在创建 backend 前完成严格类型和值域校验。"""
+    with pytest.raises(ValueError):
+        AppConfig(api_model=" ")
+    with pytest.raises(TypeError):
+        AppConfig(api_enable_thinking="false")  # type: ignore[arg-type]
+    with pytest.raises(ValueError):
+        AppConfig(api_thinking_budget=0)
+    with pytest.raises(TypeError):
+        AppConfig(api_thinking_budget=True)
+    with pytest.raises(TypeError):
+        AppConfig(api_thinking_options_supported=1)  # type: ignore[arg-type]
+
+
+def test_config_api_runtime_options_from_env(monkeypatch) -> None:
+    """模型、thinking 三态、budget 与 capability 由统一配置层读取。"""
+    from config import (
+        api_enable_thinking_from_env,
+        api_model_from_env,
+        api_thinking_budget_from_env,
+        api_thinking_options_supported_from_env,
+    )
+
+    monkeypatch.setenv("DASHSCOPE_API_MODEL", " model-a ")
+    monkeypatch.delenv("GUI_AGENT_API_ENABLE_THINKING", raising=False)
+    monkeypatch.delenv("GUI_AGENT_API_THINKING_BUDGET", raising=False)
+    monkeypatch.delenv("GUI_AGENT_API_THINKING_OPTIONS_SUPPORTED", raising=False)
+    assert api_model_from_env() == "model-a"
+    assert api_enable_thinking_from_env() is False
+    assert api_thinking_budget_from_env() is None
+    assert api_thinking_options_supported_from_env() is True
+
+    monkeypatch.setenv("GUI_AGENT_API_ENABLE_THINKING", "true")
+    monkeypatch.setenv("GUI_AGENT_API_THINKING_BUDGET", "128")
+    monkeypatch.setenv("GUI_AGENT_API_THINKING_OPTIONS_SUPPORTED", "false")
+    assert api_enable_thinking_from_env() is True
+    assert api_thinking_budget_from_env() == 128
+    assert api_thinking_options_supported_from_env() is False
+
+    monkeypatch.setenv("GUI_AGENT_API_ENABLE_THINKING", "none")
+    assert api_enable_thinking_from_env() is None
+
+
 def test_main_config_from_arguments(monkeypatch) -> None:
     """config_from_arguments 正确转换参数。"""
     from pathlib import Path
@@ -161,10 +223,18 @@ def test_main_config_from_arguments(monkeypatch) -> None:
 
     monkeypatch.setenv("GUI_AGENT_LOCAL_MODEL_DIR", "/tmp/model")
     monkeypatch.setenv("GUI_AGENT_COORDINATE_MODE", "image_pixel")
+    monkeypatch.setenv("DASHSCOPE_API_MODEL", "model-a")
+    monkeypatch.delenv("GUI_AGENT_API_ENABLE_THINKING", raising=False)
+    monkeypatch.delenv("GUI_AGENT_API_THINKING_BUDGET", raising=False)
+    monkeypatch.delenv("GUI_AGENT_API_THINKING_OPTIONS_SUPPORTED", raising=False)
     parser = create_argument_parser()
     args = parser.parse_args(["--model-mode", "api", "--max-steps", "5"])
     config = config_from_arguments(args)
     assert config.model_mode == "api"
+    assert config.api_model == "model-a"
+    assert config.api_enable_thinking is False
+    assert config.api_thinking_budget is None
+    assert config.api_thinking_options_supported is True
     assert config.max_steps == 5
     assert config.local_model_dir == Path("/tmp/model")
     assert config.coordinate_mode == "image_pixel"
@@ -207,9 +277,12 @@ def test_main_build_production_agent_wiring(monkeypatch) -> None:
         def generate(self, image, prompt):
             return "ok"
 
+    api_runtime_options: dict[str, object] = {}
+
     class FakeAPI:
         @classmethod
         def from_env(cls, **kw):
+            api_runtime_options.update(kw)
             return cls()
 
         def generate(self, image, prompt):
@@ -238,7 +311,16 @@ def test_main_build_production_agent_wiring(monkeypatch) -> None:
         retry_count=2,
         local_model_dir=Path("/tmp/model"),
         coordinate_mode="normalized_1000",
+        api_model="configured-model",
+        api_enable_thinking=False,
+        api_thinking_budget=128,
+        api_thinking_options_supported=True,
     )
+    # 决策协议开关经环境变量进入 production settings;V3 之前漏接导致
+    # --agent-protocol v3 实际静默运行 V1,此处固化两条 env→settings 通路。
+    monkeypatch.setenv("GUI_AGENT_DECISION_PROTOCOL_V2", "0")
+    monkeypatch.setenv("GUI_AGENT_DECISION_PROTOCOL_V3", "1")
+    monkeypatch.setenv("GUI_AGENT_HIDE_OWN_WINDOW_DURING_RUN", "1")
     agent = main_module.build_production_agent(config, lambda *_: None)
 
     # 验证 wiring 传递的配置。
@@ -246,7 +328,55 @@ def test_main_build_production_agent_wiring(monkeypatch) -> None:
     assert agent._settings.retry_count == 2
     assert agent._settings.model_mode == "local"
     assert agent._settings.coordinate_mode == "normalized_1000"
+    assert agent._settings.decision_protocol_v2 is False
+    assert agent._settings.decision_protocol_v3 is True
+    assert agent._settings.hide_own_window_during_run is True
     assert agent._dependencies.action_dispatcher._coordinate_mode == "normalized_1000"
+    assert api_runtime_options == {
+        "model": "configured-model",
+        "enable_thinking": False,
+        "thinking_budget": 128,
+        "supports_thinking_options": True,
+    }
+
+    # 2026-08-19 baseline 切换:环境变量全部未设置时研发默认协议为
+    # CLEAN V3;显式 V1(=0)/V2(=1 且 V3=0)/V3(=1)仍完全可选。
+    # 同日起 SEMANTIC EXECUTION 未设置时随 V3 默认启用;显式 0 关闭;
+    # 显式 V1/V2 保持旧行为不启用。
+    from config import (
+        decision_protocol_v2_from_env,
+        decision_protocol_v3_from_env,
+        semantic_execution_from_env,
+    )
+
+    monkeypatch.delenv("GUI_AGENT_DECISION_PROTOCOL_V2", raising=False)
+    monkeypatch.delenv("GUI_AGENT_DECISION_PROTOCOL_V3", raising=False)
+    monkeypatch.delenv("GUI_AGENT_SEMANTIC_EXECUTION", raising=False)
+    default_agent = main_module.build_production_agent(config, lambda *_: None)
+    assert default_agent._settings.decision_protocol_v3 is True
+    assert default_agent._settings.decision_protocol_v2 is False
+    assert default_agent._settings.semantic_execution is True
+    assert decision_protocol_v3_from_env() is True
+    assert semantic_execution_from_env() is None
+    monkeypatch.setenv("GUI_AGENT_SEMANTIC_EXECUTION", "0")
+    assert default_agent is not None  # 显式关闭仍可构造
+    semantic_off = main_module.build_production_agent(config, lambda *_: None)
+    assert semantic_off._settings.semantic_execution is False
+    monkeypatch.delenv("GUI_AGENT_SEMANTIC_EXECUTION", raising=False)
+    monkeypatch.setenv("GUI_AGENT_DECISION_PROTOCOL_V3", "0")
+    explicit_v1 = main_module.build_production_agent(config, lambda *_: None)
+    assert explicit_v1._settings.decision_protocol_v3 is False
+    assert explicit_v1._settings.semantic_execution is False
+    assert decision_protocol_v3_from_env() is False
+    monkeypatch.setenv("GUI_AGENT_DECISION_PROTOCOL_V2", "1")
+    explicit_v2 = main_module.build_production_agent(config, lambda *_: None)
+    assert explicit_v2._settings.decision_protocol_v2 is True
+    assert explicit_v2._settings.semantic_execution is False
+    assert decision_protocol_v2_from_env() is True
+    monkeypatch.setenv("GUI_AGENT_DECISION_PROTOCOL_V3", "1")
+    explicit_v3 = main_module.build_production_agent(config, lambda *_: None)
+    assert explicit_v3._settings.decision_protocol_v3 is True
+    assert explicit_v3._settings.semantic_execution is True
     assert agent._dependencies.action_dispatcher is not None
     assert agent._dependencies.model_client is not None
     assert agent._dependencies.protect_initial_foreground is True
@@ -366,6 +496,137 @@ def test_api_backend_payload_structure() -> None:
     assert content[0]["type"] == "image_url"
     assert content[1]["type"] == "text"
     assert content[1]["text"] == "test prompt"
+
+
+def test_default_api_transport_reuses_one_session(monkeypatch) -> None:
+    """默认 transport 在多次模型调用间复用同一个 HTTP Session。"""
+    responses = [
+        _FakeResponse(200, {"choices": [{"message": {"content": "one"}}]}),
+        _FakeResponse(200, {"choices": [{"message": {"content": "two"}}]}),
+    ]
+    transport = _FakeTransport(responses)
+    state = {"session_calls": 0}
+
+    class _RequestsModule:
+        @staticmethod
+        def Session():
+            state["session_calls"] += 1
+            return transport
+
+    from agent import dashscope_api_backend as backend_module
+
+    monkeypatch.setattr(
+        backend_module.importlib,
+        "import_module",
+        lambda name: _RequestsModule(),
+    )
+    backend = DashScopeAPIBackend("key", "model")
+    assert backend.generate(Image.new("RGB", (2, 2)), "p1") == "one"
+    assert backend.generate(Image.new("RGB", (2, 2)), "p2") == "two"
+    assert state["session_calls"] == 1
+    assert len(transport.calls) == 2
+
+
+@pytest.mark.parametrize("enable_thinking", [False, True])
+def test_api_backend_sends_explicit_thinking_override(
+    enable_thinking: bool,
+) -> None:
+    """false/true 均按配置发送，不依据模型名称猜测。"""
+    transport = _FakeTransport(
+        [_FakeResponse(200, {"choices": [{"message": {"content": "ok"}}]})],
+    )
+    backend = DashScopeAPIBackend(
+        "key",
+        "arbitrary-vision-model",
+        enable_thinking=enable_thinking,
+        supports_thinking_options=True,
+        transport=transport,
+    )
+
+    backend.generate(Image.new("RGB", (2, 2)), "test prompt")
+
+    assert transport.calls[0]["json"]["enable_thinking"] is enable_thinking
+
+
+def test_api_backend_omits_none_thinking_override() -> None:
+    """None 保留 provider/model 默认行为，不发送 override。"""
+    transport = _FakeTransport(
+        [_FakeResponse(200, {"choices": [{"message": {"content": "ok"}}]})],
+    )
+    backend = DashScopeAPIBackend(
+        "key",
+        "qwen3.6-flash",
+        enable_thinking=None,
+        supports_thinking_options=True,
+        transport=transport,
+    )
+
+    backend.generate(Image.new("RGB", (2, 2)), "test prompt")
+
+    assert "enable_thinking" not in transport.calls[0]["json"]
+
+
+def test_api_backend_propagates_configured_thinking_budget() -> None:
+    """thinking_budget 只在配置明确给出且 provider 支持时发送。"""
+    transport = _FakeTransport(
+        [_FakeResponse(200, {"choices": [{"message": {"content": "ok"}}]})],
+    )
+    backend = DashScopeAPIBackend(
+        "key",
+        "arbitrary-vision-model",
+        enable_thinking=True,
+        thinking_budget=128,
+        supports_thinking_options=True,
+        transport=transport,
+    )
+
+    backend.generate(Image.new("RGB", (2, 2)), "test prompt")
+
+    payload = transport.calls[0]["json"]
+    assert payload["enable_thinking"] is True
+    assert payload["thinking_budget"] == 128
+
+
+def test_api_backend_omits_unsupported_thinking_options() -> None:
+    """第三方/provider capability 关闭时不接收 thinking 专用字段。"""
+    transport = _FakeTransport(
+        [_FakeResponse(200, {"choices": [{"message": {"content": "ok"}}]})],
+    )
+    backend = DashScopeAPIBackend(
+        "key",
+        "qwen3.6-flash",
+        endpoint="https://example.com/v1/chat/completions",
+        enable_thinking=False,
+        thinking_budget=128,
+        supports_thinking_options=False,
+        transport=transport,
+    )
+
+    backend.generate(Image.new("RGB", (2, 2)), "test prompt")
+
+    payload = transport.calls[0]["json"]
+    assert "enable_thinking" not in payload
+    assert "thinking_budget" not in payload
+
+
+def test_api_backend_has_no_model_name_special_case() -> None:
+    """同一显式配置对任意模型名生成相同 runtime options。"""
+    payloads = []
+    for model in ("qwen3.6-flash", "unrelated-vision-model"):
+        transport = _FakeTransport(
+            [_FakeResponse(200, {"choices": [{"message": {"content": "ok"}}]})],
+        )
+        backend = DashScopeAPIBackend(
+            "key",
+            model,
+            enable_thinking=False,
+            supports_thinking_options=True,
+            transport=transport,
+        )
+        backend.generate(Image.new("RGB", (2, 2)), "test prompt")
+        payloads.append(transport.calls[0]["json"])
+
+    assert [payload["enable_thinking"] for payload in payloads] == [False, False]
 
 
 def test_api_backend_validate_args() -> None:
@@ -552,6 +813,54 @@ def test_openvino_backend_validates_model_dir(tmp_path) -> None:
         Qwen2VLOpenVINOBackend(empty, device=" ")
 
 
+def test_openvino_backend_uses_single_image_vlm_contract(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """OpenVINO VLM 调用包含视觉占位符并传入单张 image。"""
+    from agent.openvino_backend import Qwen2VLOpenVINOBackend
+
+    model_dir = tmp_path / "export"
+    model_dir.mkdir()
+    (model_dir / "openvino_language_model.xml").write_text(
+        "stub",
+        encoding="utf-8",
+    )
+    calls = []
+
+    class FakePipeline:
+        def generate(self, prompt, **kwargs):
+            calls.append((prompt, kwargs))
+            return 'Action: finish(result="ok")'
+
+    class FakeTensor:
+        def __init__(self, array) -> None:
+            self.array = array
+
+    class FakeGenerationConfig:
+        def __init__(self, **kwargs) -> None:
+            self.options = kwargs
+
+    monkeypatch.setitem(sys.modules, "openvino", SimpleNamespace(Tensor=FakeTensor))
+    monkeypatch.setitem(
+        sys.modules,
+        "openvino_genai",
+        SimpleNamespace(GenerationConfig=FakeGenerationConfig),
+    )
+    backend = Qwen2VLOpenVINOBackend(model_dir)
+    backend._pipeline = FakePipeline()
+
+    result = backend.generate(Image.new("RGB", (4, 3)), "用户任务")
+
+    assert result == 'Action: finish(result="ok")'
+    assert calls[0][0].startswith(
+        "<|vision_start|><|image_pad|><|vision_end|>\n",
+    )
+    assert calls[0][0].endswith("用户任务")
+    assert "image" in calls[0][1]
+    assert "images" not in calls[0][1]
+
+
 def test_local_runtime_config_selection(monkeypatch: pytest.MonkeyPatch) -> None:
     """本地运行时环境变量校验与默认 transformers 基线。"""
     from config import local_runtime_from_env, openvino_model_dir_from_env
@@ -570,3 +879,37 @@ def test_local_runtime_config_selection(monkeypatch: pytest.MonkeyPatch) -> None
         r"C:\AI\OpenVINO\export",
     )
     assert openvino_model_dir_from_env() is not None
+
+
+def test_repeated_api_exhaustion_fails_only_at_max_steps() -> None:
+    """PRD 4.5.1:反复 API 耗尽不提前 fail,仅在 max_steps 处终态(C2)。"""
+    from agent.task_manager import TaskManager, TaskStatus
+
+    backend = SequenceBackend(["API 模型调用失败。"] * 3)
+    controls = MemoryControls()
+    manager = TaskManager("任务")
+    result = asyncio.run(
+        make_agent(backend, controls, manager, max_steps=3)(
+            Msg("u", "任务", "user"),
+        ),
+    )
+    assert manager.state.status is TaskStatus.FAILED
+    assert "任务达到最大执行步数" in result.content
+    assert backend.calls == 3
+    assert all(step.result is False for step in manager.state.steps)
+
+
+def test_local_image_max_dim_default_and_env(monkeypatch) -> None:
+    """P5:local 模式图像长边上限默认 640,env 可覆盖并做下限校验。"""
+    from config import local_model_image_max_dim_from_env
+
+    monkeypatch.delenv("GUI_AGENT_LOCAL_IMAGE_MAX_DIM", raising=False)
+    assert local_model_image_max_dim_from_env() == 640
+    monkeypatch.setenv("GUI_AGENT_LOCAL_IMAGE_MAX_DIM", "512")
+    assert local_model_image_max_dim_from_env() == 512
+    monkeypatch.setenv("GUI_AGENT_LOCAL_IMAGE_MAX_DIM", "100")
+    try:
+        local_model_image_max_dim_from_env()
+        raise AssertionError("应抛 ValueError")
+    except ValueError:
+        pass

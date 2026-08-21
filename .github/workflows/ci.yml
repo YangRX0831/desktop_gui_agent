@@ -1,0 +1,53 @@
+# P6 最小质量门禁(CS-TOOL-002)。
+# 覆盖:pytest tests/、benchmark self-tests、black/isort/flake8 全树、
+# production mypy(canonical 命令,硬门)。
+# 说明:
+# - CI 只安装测试收集期真实导入的依赖子集(agentscope/mss/pillow/
+#   numpy/opencv-python);PaddleOCR/PyTorch/OpenVINO 属 PRD 环境层,
+#   由 verify_env.py 与 README 环境说明覆盖,不在 CI 安装。
+# - production mypy 使用与本地 canonical 相同的环境形态:解释器无
+#   agentscope 包,--ignore-missing-imports 将其按缺失处理,复现
+#   PRODUCTION_MYPY=0 口径。tests/benchmark 的类型债务为渐进项,
+#   不纳入硬门(见 README"已知限制")。
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  tests-and-quality:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+      - name: Install test-time dependencies
+        run: >
+          python -m pip install --upgrade pip &&
+          python -m pip install pytest agentscope mss pillow numpy opencv-python
+      - name: pytest tests/
+        run: python -B -m pytest tests -q -p no:cacheprovider
+      - name: benchmark self-tests
+        run: python -B -m pytest benchmark -q -p no:cacheprovider
+      - name: black
+        run: python -m pip install black && python -m black --check agent perception control utils main.py config.py verify_env.py tests benchmark
+      - name: isort
+        run: python -m pip install isort && python -m isort --check-only --profile black agent perception control utils main.py config.py verify_env.py tests benchmark
+      - name: flake8
+        run: python -m pip install flake8 && python -m flake8 --max-line-length=88 --extend-ignore=E203,W503 agent perception control utils main.py config.py verify_env.py tests benchmark
+
+  mypy-production:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+      - name: Install mypy only (canonical no-agentscope form)
+        run: python -m pip install --upgrade pip && python -m pip install mypy
+      - name: production mypy (hard gate)
+        run: >
+          python -m mypy --ignore-missing-imports
+          config.py main.py verify_env.py agent perception control utils

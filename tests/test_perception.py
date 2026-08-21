@@ -602,3 +602,147 @@ def test_ocr_score_text_length_mismatch() -> None:
     image = Image.new("RGB", (1, 1))
     with pytest.raises(OCRRecognitionError):
         OCRRecognizer(engine).recognize(image)  # type: ignore[arg-type]
+
+
+# ======================================================================
+# E2-A characterization:audio_state COM 生命周期(Release/CoUninitialize)
+# ======================================================================
+
+
+class _FakeComMachine:
+    """脚本化 ole32/vtable/WINFUNCTYPE 全链;记录 Release 与卸载配对。"""
+
+    def __init__(
+        self,
+        *,
+        init_hr=0,
+        create_hr=0,
+        default_hr=0,
+        activate_hr=0,
+        level_hr=0,
+        level=0.55,
+        level_raises=False,
+    ):
+        self.init_calls: list[int] = []
+        self.uninit_calls = 0
+        self.released: list[int] = []
+        self.script = {
+            "init_hr": init_hr,
+            "create_hr": create_hr,
+            "default_hr": default_hr,
+            "activate_hr": activate_hr,
+            "level_hr": level_hr,
+            "level": level,
+            "level_raises": level_raises,
+        }
+
+    def CoInitializeEx(self, reserved, mode):
+        self.init_calls.append(mode)
+        return self.script["init_hr"]
+
+    def CoUninitialize(self) -> None:
+        self.uninit_calls += 1
+
+    def CoCreateInstance(self, clsid, outer, context, iid, out):
+        if self.script["create_hr"] == 0:
+            out._obj.value = 0x1000
+        return self.script["create_hr"]
+
+
+def _fake_vtable(pointer):
+    if pointer == 0x1000:
+        return [0, 0, 0x1002, 0, 0x1004]
+    if pointer == 0x2000:
+        return [0, 0, 0x2002, 0x2003]
+    return [0, 0, 0x3002] + [0] * 6 + [0x3009]
+
+
+def _install_fake_com(monkeypatch, machine):
+    from perception import audio_state
+
+    def fake_winfunctype(*types):
+        def binder(address):
+            def call(*args):
+                script = machine.script
+                if address in (0x1002, 0x2002, 0x3002):
+                    machine.released.append(address)
+                    return 0
+                if address == 0x1004:
+                    if script["default_hr"] == 0:
+                        args[3]._obj.value = 0x2000
+                    return script["default_hr"]
+                if address == 0x2003:
+                    if script["activate_hr"] == 0:
+                        args[4]._obj.value = 0x3000
+                    return script["activate_hr"]
+                if address == 0x3009:
+                    if script["level_raises"]:
+                        raise RuntimeError("level boom")
+                    if script["level_hr"] == 0:
+                        args[1]._obj.value = script["level"]
+                    return script["level_hr"]
+                raise AssertionError(f"未脚本化的 COM 地址: {address}")
+
+            return call
+
+        return binder
+
+    monkeypatch.setattr(audio_state, "ole32", machine, raising=True)
+    monkeypatch.setattr(audio_state, "_vtable", _fake_vtable, raising=True)
+    monkeypatch.setattr(audio_state, "WINFUNCTYPE", fake_winfunctype, raising=True)
+
+
+def test_com_volume_success_releases_and_uninitializes(monkeypatch) -> None:
+    """成功路径:三接口逆序 Release 一次,CoUninitialize 恰好配对一次。"""
+    from perception import audio_state
+
+    machine = _FakeComMachine()
+    _install_fake_com(monkeypatch, machine)
+    assert audio_state.get_master_volume_percent() == 55
+    assert machine.released == [0x3002, 0x2002, 0x1002]
+    assert machine.uninit_calls == 1
+    assert machine.init_calls == [4]
+
+
+def test_com_acquire_failure_still_uninitializes(monkeypatch) -> None:
+    """枚举器获取失败:无接口可释放,但 CoUninitialize 仍配对。"""
+    from perception import audio_state
+
+    machine = _FakeComMachine(create_hr=1)
+    _install_fake_com(monkeypatch, machine)
+    assert audio_state.get_master_volume_percent() is None
+    assert machine.released == []
+    assert machine.uninit_calls == 1
+
+
+def test_com_default_failure_releases_enumerator_only(monkeypatch) -> None:
+    """链中失败:只释放已获取接口(枚举器),再卸载。"""
+    from perception import audio_state
+
+    machine = _FakeComMachine(default_hr=1)
+    _install_fake_com(monkeypatch, machine)
+    assert audio_state.get_master_volume_percent() is None
+    assert machine.released == [0x1002]
+    assert machine.uninit_calls == 1
+
+
+def test_com_level_exception_releases_all(monkeypatch) -> None:
+    """取值异常路径:三接口全部释放,不外抛,卸载配对。"""
+    from perception import audio_state
+
+    machine = _FakeComMachine(level_raises=True)
+    _install_fake_com(monkeypatch, machine)
+    assert audio_state.get_master_volume_percent() is None
+    assert machine.released == [0x3002, 0x2002, 0x1002]
+    assert machine.uninit_calls == 1
+
+
+def test_com_init_failure_skips_uninitialize(monkeypatch) -> None:
+    """CoInitializeEx 失败 HRESULT:COM 未初始化,不得调用卸载。"""
+    from perception import audio_state
+
+    machine = _FakeComMachine(init_hr=-2147417850)
+    _install_fake_com(monkeypatch, machine)
+    assert audio_state.get_master_volume_percent() is None
+    assert machine.uninit_calls == 0
+    assert machine.released == []

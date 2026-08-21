@@ -567,6 +567,25 @@ def test_case1_target_is_business_window_not_cli(
     assert target == {"hwnd": 111, "process": "notepad.exe"}
 
 
+def test_demonstrative_window_phrase_is_relative_reference() -> None:
+    """“那个…窗口”与“当前窗口”一样绑定提交前业务窗口。"""
+    import main as main_module
+
+    assert main_module._has_relative_window_reference(
+        "关闭桌面上那个测试专用的空白记事本窗口。",
+    )
+    assert not main_module._has_relative_window_reference("打开记事本")
+
+
+def test_visible_end_state_intent_is_narrow_and_explicit() -> None:
+    """仅明确要求保留在界面/窗口的任务抑制成功后的 CLI 抢焦点。"""
+    from agent.gui_agent import _task_requests_visible_end_state
+
+    assert _task_requests_visible_end_state("让最终结果保留在计算器界面")
+    assert _task_requests_visible_end_state("保持在当前窗口")
+    assert not _task_requests_visible_end_state("打开计算器并计算1+1")
+
+
 def test_case3_same_process_windows_distinguished_by_id(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -641,6 +660,95 @@ def test_reference_task_minimizes_cli_and_activates_target(
         "hwnd": 111,
         "process": "notepad.exe",
     }
+    assert sent.metadata["agent_ui_window_hwnd"] == 222
+
+
+@pytest.mark.parametrize("reference", ["当前浏览器", "当前网页"])
+def test_browser_reference_resolves_target(
+    monkeypatch: pytest.MonkeyPatch,
+    reference: str,
+) -> None:
+    """浏览器与网页相对指代沿用通用前台目标解析。"""
+    import main as main_module
+
+    class FakeAgent:
+        def __init__(self) -> None:
+            self.messages: list[object] = []
+
+        async def __call__(self, msg):
+            self.messages.append(msg)
+            from agentscope.message import Msg
+
+            return Msg("agent", "ok", "assistant")
+
+    fake_agent = FakeAgent()
+    timeline = _make_timeline((111, "chrome.exe"), (222, "WindowsTerminal.exe"))
+    monkeypatch.setattr(main_module, "get_foreground_app_hwnd", lambda: 222)
+    monkeypatch.setattr(main_module, "is_window_existing", lambda hwnd: True)
+    monkeypatch.setattr(main_module, "minimize_window", lambda hwnd: True)
+    monkeypatch.setattr(main_module, "activate_window", lambda hwnd: True)
+    monkeypatch.setattr(
+        main_module,
+        "start_foreground_timeline",
+        lambda: (timeline, threading.Event()),
+    )
+
+    inputs = iter([f"使用{reference}完成任务", "exit"])
+    asyncio.run(
+        main_module.run_cli(
+            main_module.AppConfig(),
+            read_input=lambda *_: next(inputs),
+            write_output=lambda *_: None,
+            agent_factory=lambda *_: fake_agent,
+        ),
+    )
+    assert fake_agent.messages[0].metadata == {
+        "task_target_window": {"hwnd": 111, "process": "chrome.exe"},
+        "agent_ui_window_hwnd": 222,
+    }
+
+
+def test_browser_reference_skips_newer_non_browser(monkeypatch) -> None:
+    """当前浏览器按能力类别解析，不把更近的普通业务窗口误绑定为浏览器。"""
+    import main as main_module
+
+    timeline = _make_timeline(
+        (111, "chrome.exe"),
+        (333, "ChatGPT.exe"),
+        (222, "WindowsTerminal.exe"),
+    )
+    monkeypatch.setattr(main_module, "get_foreground_app_hwnd", lambda: 222)
+    monkeypatch.setattr(main_module, "is_window_existing", lambda hwnd: True)
+    target = main_module.resolve_task_target_window(
+        timeline,
+        main_module._BROWSER_PROCESS_NAMES,
+    )
+    assert target == {"hwnd": 111, "process": "chrome.exe"}
+
+
+def test_browser_reference_falls_back_to_visible_zorder(monkeypatch) -> None:
+    """时间线未观察到浏览器时，回退到最上层可见浏览器窗口。"""
+    import main as main_module
+
+    timeline = _make_timeline(
+        (333, "ChatGPT.exe"),
+        (222, "WindowsTerminal.exe"),
+    )
+    monkeypatch.setattr(main_module, "get_foreground_app_hwnd", lambda: 222)
+    monkeypatch.setattr(main_module, "is_window_existing", lambda hwnd: True)
+    monkeypatch.setattr(
+        main_module,
+        "list_visible_windows_zorder",
+        lambda: [
+            {"hwnd": 333, "process": "ChatGPT.exe"},
+            {"hwnd": 444, "process": "chrome.exe"},
+        ],
+    )
+    target = main_module.resolve_task_target_window(
+        timeline,
+        main_module._BROWSER_PROCESS_NAMES,
+    )
+    assert target == {"hwnd": 444, "process": "chrome.exe"}
 
 
 def test_non_reference_task_sends_no_metadata(

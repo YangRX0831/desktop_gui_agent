@@ -279,6 +279,11 @@ class ActionDispatcher:
             if set(params) != {"result"} or not isinstance(params["result"], str):
                 return self._validation_failure("invalid_finish")
             return True
+        if action_type == "observe":
+            # observe 不产生任何控制副作用;编排层负责等待与重新观察。
+            if params != {}:
+                return self._validation_failure("invalid_observe")
+            return True
         return self._validation_failure("unsupported_action")
 
     def _dispatch_click(
@@ -338,21 +343,29 @@ class ActionDispatcher:
         """把 drag 起终点映射为全局桌面像素后交控制器拖拽。"""
         if set(params) != {"x1", "y1", "x2", "y2"}:
             return self._validation_failure("drag_params")
-        raw_values = [params[key] for key in ("x1", "y1", "x2", "y2")]
-        if any(type(value) is not int for value in raw_values):
+        raw_x1 = params["x1"]
+        raw_y1 = params["y1"]
+        raw_x2 = params["x2"]
+        raw_y2 = params["y2"]
+        if (
+            type(raw_x1) is not int
+            or type(raw_y1) is not int
+            or type(raw_x2) is not int
+            or type(raw_y2) is not int
+        ):
             return self._validation_failure("drag_coordinate_type")
 
         start = self._resolve_point_pixels(
-            raw_values[0],
-            raw_values[1],
+            raw_x1,
+            raw_y1,
             screenshot_size,
             "drag_start",
         )
         if start is None:
             return False
         end = self._resolve_point_pixels(
-            raw_values[2],
-            raw_values[3],
+            raw_x2,
+            raw_y2,
             screenshot_size,
             "drag_end",
         )

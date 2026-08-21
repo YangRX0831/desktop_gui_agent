@@ -4,10 +4,10 @@
     模型响应属于不可信输入。Parser 只把完整匹配白名单语法的单个动作
     转换为 ``ParsedAction``，其余文本统一拒绝，不猜测模型意图。
 
-    PRD 4.3.2 的提示词模板是这里的 canonical baseline。production Prompt
-    在不改变五种动作、语法和模型调用接口的前提下，按 PRD 允许的效果优化
-    补充严格输出与 finish 时机说明。Parser 只做语法与字段校验，不假设
-    坐标空间；坐标空间由 ``ActionDispatcher`` 在映射到桌面像素时解释。
+    PRD 4.3.2 的五动作提示词模板保留为 legacy canonical baseline；当前
+    production V3 使用人工冻结的八动作合同。Parser 只做语法与字段校验，
+    不假设坐标空间；坐标空间由 ``ActionDispatcher`` 在映射到桌面像素时
+    解释。
 
 安全边界：
     本模块不执行模型文本，不使用动态求值，也不记录原始响应。解析失败
@@ -22,7 +22,7 @@ import json
 import logging
 import re
 from dataclasses import dataclass
-from typing import Literal, TypedDict
+from typing import Literal, TypedDict, TypeGuard
 
 from control.keyboard_controller import is_supported_key
 
@@ -37,7 +37,21 @@ ActionType = Literal[
     "scroll",
     "hotkey",
     "finish",
+    "observe",
 ]
+
+# ACTION-CONTRACT-002:V3 模型动作的唯一权威集合。observe 仅属于 legacy
+# V2 编排扩展；move_to/press/release 继续作为 controller internal primitives。
+CANONICAL_V3_ACTIONS = (
+    "click",
+    "right_click",
+    "double_click",
+    "drag",
+    "type",
+    "scroll",
+    "hotkey",
+    "finish",
+)
 
 
 class ClickParams(TypedDict):
@@ -145,6 +159,10 @@ class FinishParams(TypedDict):
     result: str
 
 
+class ObserveParams(TypedDict):
+    """observe 动作无参数;params 恒为空字典。"""
+
+
 ParsedParams = (
     ClickParams
     | RightClickParams
@@ -154,6 +172,7 @@ ParsedParams = (
     | ScrollParams
     | HotkeyParams
     | FinishParams
+    | ObserveParams
 )
 PromptStatus = Literal["success", "failure", "none"]
 PromptProgress = Literal["strong", "weak", "none", "unknown"]
@@ -173,20 +192,88 @@ PromptEffect = Literal[
 ]
 
 
-class ParsedAction(TypedDict):
-    """保存已通过严格语法和参数校验的单个白名单动作。
+class ClickAction(TypedDict):
+    """click 动作的可判别联合体成员。"""
 
-    Attributes:
-        action_type: 五种 PRD 白名单动作之一。
-        params: 与动作类型对应且已经过词法校验的参数结构。
+    action_type: Literal["click"]
+    params: ClickParams
 
-    ``parse_action`` 创建该结构，``ActionDispatcher`` 或 ``GuiAgent`` 按
-    ``action_type`` 消费；模型原文不能绕过该结构进入控制层。典型用法是
-    Parser 返回后立即分发，不由调用方手工拼接该字典。
-    """
 
-    action_type: ActionType
-    params: ParsedParams
+class RightClickAction(TypedDict):
+    """right_click 动作的可判别联合体成员。"""
+
+    action_type: Literal["right_click"]
+    params: RightClickParams
+
+
+class DoubleClickAction(TypedDict):
+    """double_click 动作的可判别联合体成员。"""
+
+    action_type: Literal["double_click"]
+    params: DoubleClickParams
+
+
+class DragAction(TypedDict):
+    """drag 动作的可判别联合体成员。"""
+
+    action_type: Literal["drag"]
+    params: DragParams
+
+
+class TypeAction(TypedDict):
+    """type 动作的可判别联合体成员。"""
+
+    action_type: Literal["type"]
+    params: TypeParams
+
+
+class ScrollAction(TypedDict):
+    """scroll 动作的可判别联合体成员。"""
+
+    action_type: Literal["scroll"]
+    params: ScrollParams
+
+
+class HotkeyAction(TypedDict):
+    """hotkey 动作的可判别联合体成员。"""
+
+    action_type: Literal["hotkey"]
+    params: HotkeyParams
+
+
+class FinishAction(TypedDict):
+    """finish 动作的可判别联合体成员。"""
+
+    action_type: Literal["finish"]
+    params: FinishParams
+
+
+class ObserveAction(TypedDict):
+    """observe 动作的可判别联合体成员。"""
+
+    action_type: Literal["observe"]
+    params: ObserveParams
+
+
+ParsedAction = (
+    ClickAction
+    | RightClickAction
+    | DoubleClickAction
+    | DragAction
+    | TypeAction
+    | ScrollAction
+    | HotkeyAction
+    | FinishAction
+    | ObserveAction
+)
+
+# click 族共享 x,y 坐标参数;TypeGuard 让 mypy 收窄联合体后可安全访问。
+PointAction = ClickAction | RightClickAction | DoubleClickAction
+
+
+def is_click_like_action(action: ParsedAction) -> TypeGuard[PointAction]:
+    """click/right_click/double_click 判别;三者 params 均含 x,y。"""
+    return action["action_type"] in ("click", "right_click", "double_click")
 
 
 PromptReadiness = Literal["true", "false", "unknown"]
@@ -216,6 +303,27 @@ class ActionPromptState:
     platform: PromptPlatform = "unknown"
     ocr_elements: tuple[str, ...] = ()
     windows: tuple[str, ...] = ()
+    # V2 决策协议字段(保守模式:current_goal 初始等于任务原文)
+    current_goal: str = ""
+    consecutive_observe_count: int = 0
+    previous_strategy_failed: bool = False
+    blocked_repeated_action: str = "none"
+    structured_entry_commit_feedback: bool = False
+    successful_action_count: int = 0
+    # SEMANTIC EXECUTION PHASE 2A 字段:全部 None 时不渲染任何新行,
+    # 保证 feature 关闭时 V1/V3 动态 Prompt 与 Phase 2A 之前逐字节一致。
+    steps_remaining: int | None = None
+    completion_verification: Literal["VERIFIED", "NOT_VERIFIED", "UNKNOWN"] | None = (
+        None
+    )
+    completion_reason: str | None = None
+    progress_status: (
+        Literal["UNKNOWN", "PROGRESSED", "NO_PROGRESS", "INSUFFICIENT_RATE"] | None
+    ) = None
+    progress_reason: str | None = None
+    # PHASE 2B grounding 候选的已渲染行;空元组时不渲染任何块,
+    # 保证 feature 关闭时动态 Prompt 与此前逐字节一致。
+    interactive_elements: tuple[str, ...] = ()
 
 
 # PRD 4.3.2 canonical Prompt 原文。文本和标点与 PRD 可见内容逐字对齐；
@@ -236,48 +344,49 @@ Action: 动作类型(参数)
 - 如果任务已经完成，使用finish动作"""
 
 # PRD 4.3.2 原文保留为 canonical 审计基线(不改写);production Prompt 顶部
-# 统一为 8 动作协议并按节组织通用规则,不写入应用名、平台快捷键路径或
-# 测试答案。
+# 按五动作协议组织通用规则,不写入应用名、平台快捷键路径或测试答案。
 ACTION_SYSTEM_PROMPT = """你是一个桌面GUI操作智能体，请根据当前屏幕截图、感知信息和用户指令，\
 生成下一步要执行的动作。
 
-合法动作(唯一协议，每轮只输出一个)：
+合法动作(唯一协议，只存在以下五种，每轮只输出一个)：
 1. click(x=<整数>, y=<整数>) - 单击可见控件
-2. right_click(x=<整数>, y=<整数>) - 打开目标的上下文菜单
-3. double_click(x=<整数>, y=<整数>) - 双击打开或激活对象
-4. drag(x1=<整数>, y1=<整数>, x2=<整数>, y2=<整数>) - 拖动、拖放或范围选择
-5. type(text="<文本>") - 输入文本
-6. scroll(direction="<up/down>", steps=<整数>) - 滚动屏幕
-7. hotkey(key1="<按键1>", key2="<按键2>", ...) - 按下组合键
-8. finish(result="<结果描述>") - 任务完成
+2. type(text="<文本>") - 输入文本
+3. scroll(direction="<up/down>", steps=<整数>) - 滚动屏幕
+4. hotkey(key1="<按键1>", key2="<按键2>", ...) - 按下组合键
+5. finish(result="<结果描述>") - 任务完成
 
 输出协议：
 - 整个回答只能有一行，必须以Action: 开头，只能输出一个合法动作；禁止解释、\
 计划、Markdown、代码块、前后缀或第二行。
-- 即使不能确定最佳动作，也必须选择合法且副作用最小的推进动作，不得猜测不可见\
-目标的坐标。
+- 参数名称不可省略，禁止位置参数或命名参数与位置参数混用；click必须同时包含\
+x=<整数>和y=<整数>。
+- 只能使用上述五种动作；禁止发明drag、move、right_click、double_click、open、\
+search或其他动作。
+- 正例：Action: click(x=123, y=456)
+- 反例：Action: click(x=123, 456)；Action: click(123, 456)；Action: drag(...)
+- 任务未完成时必须选择合法且副作用最小的推进动作，不得猜测不可见目标的坐标；\
+只有任务确实完成时才能使用finish。
 - 输出前静默检查格式与参数；如有错误，先在内部修正。现在只输出Action。
 
 鼠标动作语义：
 - click用于单击当前截图中明确可见的控件，尽量点击目标中心。
-- right_click只在任务需要目标对象的上下文菜单或右键行为时使用。
-- double_click只在当前UI语义明确需要双击打开或激活对象时使用；不再用两个连续\
-click模拟双击。
-- drag只在任务需要拖动、拖放、范围选择、文本选择或滑块调整时使用；起点和终点\
-必须有当前截图或感知结果支持，不得猜测不可见位置。
 
 键盘动作语义：
 - hotkey允许一个或多个按键；单字符键直接使用；命名键使用win、cmd、ctrl、alt、\
 shift、enter、esc、tab、space、backspace、delete、home、end、page_up、\
 page_down、up、down、left、right、f1到f20或media_volume_up/down/mute。\
 platform为windows时系统键使用win；platform为macos时使用cmd。
-- system_volume是当前系统主音量百分比，media_volume_up/down每次约改变2；
-需要精确音量时结合当前值计算按键次数，或打开音量面板拖动滑块。
+- system_volume是当前系统主音量百分比。
 - type只输入内容，不代表提交、执行或确认。如果输入后所需结果尚未产生，应执行\
 必要的最小提交动作；标准键盘提交可用时优先enter。
 - keyboard_input_ready=true时可直接type，无需为建立焦点额外click；\
 keyboard_input_ready=false时不得直接type，应先建立正确焦点；\
 keyboard_input_ready=unknown时结合截图、OCR和界面状态判断，不得仅凭猜测输入。
+- 在固定输入位逐项录入多项内容时，每项输入后应根据感知信息核对内容是否已落在预期位置：已落位则立即推进下一项；未落位则先恢复焦点再重输；不得对同一位置重复输入不同内容。
+- 当前已聚焦目标支持键盘输入，且任务要求精确文本、数字或表达式时，优先直接type并用必要的hotkey提交，不要逐字符点击屏幕虚拟键。
+- 录入表格或网格时必须保留行、列和字段边界；当前焦点位于起始单元格且需连续\
+录入多个字段时，优先在单个type中用制表符分列、换行分行，末项后也要包含制表符或\
+换行以提交最后单元格；不得把多个字段压入同一单元格。
 
 感知信息解释：
 - OCR主要用于文字识别和辅助定位；OCR没有识别到某个控件不代表该控件不存在，\
@@ -290,7 +399,7 @@ alt+f4等作用于前台的按键以fg=true的窗口为目标。
 
 启动与搜索：
 - 先区分启动目标和搜索目标。
-- 启动应用或命令时，使用与当前平台匹配的启动、运行或应用搜索入口。
+- 启动应用优先使用系统运行或应用搜索入口，不通过开始菜单逐级浏览。
 - 搜索内容时，使用与搜索对象及当前上下文匹配的搜索入口：任务只要求搜索关键词\
 而未指明对象时，默认指网络搜索；搜索网络信息使用浏览器地址栏或搜索引擎搜索框，\
 输入关键词后提交并等待结果列表出现，页面内查找(ctrl+f)只用于在已打开内容中\
@@ -319,8 +428,9 @@ UI时再使用鼠标动作。
 window_closed时，应把对应关闭子目标标记为完成，不得再次关闭同一目标。
 - last_dispatch_status只表示动作是否交给控制器成功；ui_change_signal只表示\
 可观察UI变化程度，不代表动作方向正确，也不代表任何任务子目标已经完成。
-- recent_actions和连续次数用于识别重复和回退；相同动作连续未产生界面变化时\
-必须改变方案，不得机械重复。
+- recent_actions显示同一动作已连续出现两次以上且ui_change_signal均为none时，\
+该动作对当前目标已判定无效：必须改用不同的动作类型或不同的目标，\
+继续重复视为错误。
 - windows描述当前可见窗口、层叠关系和位置，不负责决定任务目标。
 - 用户指令中的"当前窗口""当前应用"等相对指代，如果已绑定task_target_window，\
 则后续始终以该窗口为目标，不得因前台变化重新绑定；不得仅根据窗口层叠顺序\
@@ -337,16 +447,81 @@ window_closed时，应把对应关闭子目标标记为完成，不得再次关�
 要求且当前目标对象与用户目标匹配时才执行；不得对不确定对象执行最终确认。
 
 参数格式：
-- 参数名称和格式必须严格遵守上述定义；type不得省略text=；click、right_click、\
-double_click不得省略x=或y=，drag的四个坐标不得省略；逗号后必须保留一个空格。"""
+- 参数名称和格式必须严格遵守上述定义；click不得省略x=或y=；type不得省略\
+text=；scroll不得省略direction=或steps=；hotkey按key1、key2顺序命名；\
+finish不得省略result=；逗号后必须保留一个空格。"""
 
 
-def compose_action_prompt(
+def action_grammar_lines() -> tuple[str, ...]:
+    """按解析器真实 grammar 生成动作语法说明行(单一事实源)。
+
+    参数名与顺序直接取自各动作的编译正则分组,不手工复制第二套
+    grammar;Local Compact Prompt 等调用方据此展示语法,天然防漂移。
+    """
+    _INTEGER_GROUPS = {"x", "y", "x1", "y1", "x2", "y2", "steps"}
+    entries = {
+        "click": (_CLICK_PATTERN, "单击可见控件"),
+        "right_click": (_RIGHT_CLICK_PATTERN, "打开目标的上下文菜单"),
+        "double_click": (_DOUBLE_CLICK_PATTERN, "双击打开或激活对象"),
+        "drag": (_DRAG_PATTERN, "拖动、拖放或范围选择"),
+        "type": (_TYPE_PATTERN, "输入文本"),
+        "scroll": (_SCROLL_PATTERN, "滚动屏幕"),
+        "finish": (_FINISH_PATTERN, "任务完成"),
+    }
+    lines = []
+    for index, name in enumerate(CANONICAL_V3_ACTIONS, 1):
+        if name == "hotkey":
+            lines.append(
+                f'{index}. hotkey(key1="<按键1>", key2="<按键2>", ...) ' "- 按下组合键",
+            )
+            continue
+        pattern, description = entries[name]
+        params = []
+        for group in pattern.groupindex:
+            if group in _INTEGER_GROUPS:
+                params.append(f"{group}=<整数>")
+            elif group == "direction":
+                params.append('direction="up/down"')
+            elif group == "text":
+                params.append('text="<文本>"')
+            else:
+                params.append(f'{group}="<{group}>"')
+        lines.append(f"{index}. {name}({', '.join(params)}) - {description}")
+    return tuple(lines)
+
+
+def action_param_signature(action_name: str) -> tuple[str, ...] | None:
+    """返回动作的合法参数名元组(顺序与 grammar 一致);未知动作 None。
+
+    供 local-only 包装修复核对"参数集合与 signature 完全一致"。
+    """
+    patterns = {
+        "click": _CLICK_PATTERN,
+        "right_click": _RIGHT_CLICK_PATTERN,
+        "double_click": _DOUBLE_CLICK_PATTERN,
+        "drag": _DRAG_PATTERN,
+        "type": _TYPE_PATTERN,
+        "scroll": _SCROLL_PATTERN,
+        "finish": _FINISH_PATTERN,
+    }
+    pattern = patterns.get(action_name)
+    if pattern is not None:
+        return tuple(pattern.groupindex)
+    if action_name == "hotkey":
+        return ("key1",)
+    return None
+
+
+def _validate_dynamic_prompt_inputs(
     task: str,
     state: ActionPromptState,
     coordinate_mode: str,
-) -> str:
-    """拼接 canonical Prompt、运行状态、坐标合同与用户指令。"""
+) -> None:
+    """校验动态 Prompt 组装的输入;违规抛 TypeError/ValueError。
+
+    规则与 ``compose_action_dynamic_prompt`` 既有合同逐字一致,仅作
+    同文件私有抽取,不改变异常信息或校验顺序。
+    """
     if not isinstance(task, str):
         raise TypeError("task 必须是 str。")
     if not task.strip():
@@ -372,6 +547,8 @@ def compose_action_prompt(
         raise ValueError("state 文本字段必须是非空 str。")
     if state.last_dispatch_status not in {"success", "failure", "none"}:
         raise ValueError("state.last_dispatch_status 不是受支持的状态。")
+    if type(state.structured_entry_commit_feedback) is not bool:
+        raise ValueError("state.structured_entry_commit_feedback 必须是 bool。")
     if state.last_effect not in {
         "foreground_window_changed",
         "visible_content_changed",
@@ -412,10 +589,61 @@ def compose_action_prompt(
     ):
         if type(value) is not int or value < 0:
             raise ValueError(f"state.{name} 必须是非负 int。")
+    if state.steps_remaining is not None and (
+        type(state.steps_remaining) is not int or state.steps_remaining < 0
+    ):
+        raise ValueError("state.steps_remaining 必须是非负 int 或 None。")
+    if state.completion_verification not in {
+        None,
+        "VERIFIED",
+        "NOT_VERIFIED",
+        "UNKNOWN",
+    }:
+        raise ValueError("state.completion_verification 不是受支持的三态值。")
+    if state.progress_status not in {
+        None,
+        "UNKNOWN",
+        "PROGRESSED",
+        "NO_PROGRESS",
+        "INSUFFICIENT_RATE",
+    }:
+        raise ValueError("state.progress_status 不是受支持的推进状态。")
+    for name in ("completion_reason", "progress_reason"):
+        value = getattr(state, name)
+        if value is not None and (not isinstance(value, str) or not value):
+            raise ValueError(f"state.{name} 必须是非空 str 或 None。")
+    if (
+        not isinstance(state.interactive_elements, tuple)
+        or len(
+            state.interactive_elements,
+        )
+        > 25
+    ):
+        raise ValueError("state.interactive_elements 必须是最多二十五项的 tuple。")
+    if any(
+        not isinstance(item, str) or not item.strip()
+        for item in state.interactive_elements
+    ):
+        raise ValueError("state.interactive_elements 的每项必须是非空 str。")
+
+
+def compose_action_dynamic_prompt(
+    task: str,
+    state: ActionPromptState,
+    coordinate_mode: str,
+) -> str:
+    """校验参数并组装运行状态、感知块、坐标合同与用户指令的动态文本。
+
+    本函数是 V1 ``compose_action_prompt`` 去掉 ``ACTION_SYSTEM_PROMPT``
+    前缀后的动态部分原样提取,输出逐字与 V1 拼接结果的后段一致。
+    system/user 分层协议(V3)把它作为 user message 文本使用,静态规则
+    由调用方放入 system message,不得再混入本文本。
+    """
+    _validate_dynamic_prompt_inputs(task, state, coordinate_mode)
     coordinate_rule = (
-        "click、right_click、double_click和drag坐标使用当前截图的0到1000相对坐标。"
+        "click坐标使用当前截图的0到1000相对坐标。"
         if coordinate_mode == "normalized_1000"
-        else "click、right_click、double_click和drag坐标使用当前截图内的图像像素坐标。"
+        else "click坐标使用当前截图内的图像像素坐标。"
     )
     volume_display = (
         "unknown"
@@ -439,8 +667,65 @@ def compose_action_prompt(
         else "- windows(按层叠顺序自顶向下, bbox为相对坐标)=none\n"
     )
     perception_block = "Current perception:\n" + ocr_section + window_section
+    # PHASE 2B grounding 候选:仅非空时渲染独立块,空时输出与
+    # 此前动态块逐字节一致。
+    elements_block = (
+        "Interactive elements:\n"
+        + "".join(f"  {line}\n" for line in state.interactive_elements)
+        if state.interactive_elements
+        else ""
+    )
+    # Phase 2A 动态语义状态:仅显式设置时渲染,未设置时输出与
+    # Phase 2A 之前的动态块逐字节一致。
+    semantic_lines = "".join(
+        f"- {line}\n"
+        for line in (
+            (
+                f"steps_remaining={state.steps_remaining}"
+                if state.steps_remaining is not None
+                else None
+            ),
+            (
+                f"completion_verification={state.completion_verification}"
+                if state.completion_verification is not None
+                else None
+            ),
+            (
+                f"completion_reason={state.completion_reason}"
+                if state.completion_reason is not None
+                else None
+            ),
+            (
+                f"progress_status={state.progress_status}"
+                if state.progress_status is not None
+                else None
+            ),
+            (
+                f"progress_reason={state.progress_reason}"
+                if state.progress_reason is not None
+                else None
+            ),
+        )
+        if line is not None
+    )
+    recovery_block = ""
+    if state.previous_strategy_failed:
+        recovery_block = (
+            "Recovery feedback:\n"
+            f"- previous_action={state.blocked_repeated_action}\n"
+            "- observed_result=动作未分发；此前相同动作未产生可测任务推进。\n"
+            "- required_change=不要再次返回同一动作；请选择不同动作类型或"
+            "实质不同的目标。\n"
+        )
+    if state.structured_entry_commit_feedback:
+        recovery_block += (
+            "Recovery feedback:\n"
+            "- observed_result=Previous structured entry may still have its final "
+            "field in edit mode because the entry did not end with an explicit cell "
+            "or row commit.\n"
+            "- required_change=Verify or commit the final field before finishing.\n"
+        )
     return (
-        f"{ACTION_SYSTEM_PROMPT}\n\n"
         "Current execution state:\n"
         f"- step={state.step_number}/{state.max_steps}\n"
         f"- task_target_window={state.task_target_window}\n"
@@ -458,10 +743,25 @@ def compose_action_prompt(
         f"- same_action_streak={state.same_action_streak}\n"
         f"- no_ui_change_streak={state.no_ui_change_streak}\n"
         f"- platform={state.platform}\n"
-        f"- {coordinate_rule}\n\n"
+        f"- {coordinate_rule}\n"
+        f"{semantic_lines}\n"
+        f"{recovery_block}"
         f"{perception_block}\n"
+        f"{elements_block}"
         f"用户指令：\n{task}\n\n"
         "现在只输出一行合法Action，不要输出其他内容。"
+    )
+
+
+def compose_action_prompt(
+    task: str,
+    state: ActionPromptState,
+    coordinate_mode: str,
+) -> str:
+    """拼接 canonical Prompt 前缀与动态文本,保持 V1 单文本合同。"""
+    return (
+        f"{ACTION_SYSTEM_PROMPT}\n\n"
+        f"{compose_action_dynamic_prompt(task, state, coordinate_mode)}"
     )
 
 
@@ -505,6 +805,7 @@ _HOTKEY_ITEM_PATTERN = re.compile(
 _HOTKEY_PREFIX = "Action: hotkey("
 _ALLOWED_ACTIONS = {
     "click",
+    "observe",
     "right_click",
     "double_click",
     "drag",
@@ -513,6 +814,7 @@ _ALLOWED_ACTIONS = {
     "hotkey",
     "finish",
 }
+_PRD_MODEL_ACTIONS = frozenset(CANONICAL_V3_ACTIONS)
 
 
 def _log_parse_failure(category: str, response_length: int) -> None:
@@ -652,6 +954,16 @@ def _parse_hotkey(response: str) -> ParsedAction | None:
     return {"action_type": "hotkey", "params": {"keys": tuple(keys)}}
 
 
+_OBSERVE_PATTERN = re.compile(r"Action: observe\(\)")
+
+
+def _parse_observe(response: str) -> ParsedAction | None:
+    """解析无参数的观察动作;任何参数形式都视为非法。"""
+    if _OBSERVE_PATTERN.fullmatch(response) is None:
+        return None
+    return {"action_type": "observe", "params": {}}
+
+
 def _parse_finish(response: str) -> ParsedAction | None:
     """解析带结果文本的结束动作。"""
     match = _FINISH_PATTERN.fullmatch(response)
@@ -667,12 +979,13 @@ def _parse_action_with_error(
     response: str,
 ) -> tuple[ParsedAction | None, ActionParseError | None]:
     """解析动作并返回不含原文的失败类别。"""
-    stripped = response.strip()
-    if not stripped:
+    if not response:
         return None, "empty_response"
-    if "\r" in stripped or "\n" in stripped:
+    if "\r" in response or "\n" in response:
         return None, "multiline_response"
-    action_name_match = _ACTION_ENVELOPE_PATTERN.fullmatch(stripped)
+    if response != response.strip():
+        return None, "invalid_syntax"
+    action_name_match = _ACTION_ENVELOPE_PATTERN.fullmatch(response)
     if action_name_match is None:
         return None, "invalid_syntax"
     action_name = action_name_match.group("name")
@@ -680,6 +993,7 @@ def _parse_action_with_error(
         return None, "unsupported_action"
     parsers = {
         "click": _parse_click,
+        "observe": _parse_observe,
         "right_click": _parse_right_click,
         "double_click": _parse_double_click,
         "drag": _parse_drag,
@@ -688,7 +1002,7 @@ def _parse_action_with_error(
         "hotkey": _parse_hotkey,
         "finish": _parse_finish,
     }
-    parsed = parsers[action_name](stripped)
+    parsed = parsers[action_name](response)
     return (parsed, None) if parsed is not None else (None, "invalid_parameters")
 
 
@@ -699,30 +1013,16 @@ def classify_action_parse_error(response: str) -> ActionParseError | None:
     return _parse_action_with_error(response)[1]
 
 
-_NORMALIZATION_VERBS = (
-    "click",
-    "right_click",
-    "double_click",
-    "drag",
-    "type",
-    "scroll",
-    "hotkey",
-    "finish",
-)
-
-
-def normalize_model_output(response: str) -> str:
-    """修复小模型常见的输出前缀偏差,归一化后仍需通过严格 parser。
-
-    2B 级本地模型容易把 Prompt 动作列表的编号(如"1. ")复制为输出前缀,
-    或省略"Action: "前缀;本函数做最小格式修复,不放宽参数校验。
-    """
-    text = response.strip()
-    text = re.sub(r"^\d+\.\s*", "", text)
-    for verb in _NORMALIZATION_VERBS:
-        if text.startswith(verb + "("):
-            return f"Action: {text}"
-    return text
+def classify_prd_action_parse_error(response: str) -> ActionParseError | None:
+    """返回 canonical V3 八动作模型合同的严格错误类别。"""
+    if not isinstance(response, str):
+        raise TypeError("response 必须是 str。")
+    parsed, error = _parse_action_with_error(response)
+    if error is not None:
+        return error
+    if parsed is None or parsed["action_type"] not in _PRD_MODEL_ACTIONS:
+        return "unsupported_action"
+    return None
 
 
 def parse_action(response: str) -> ParsedAction | None:
@@ -740,8 +1040,15 @@ def parse_action(response: str) -> ParsedAction | None:
     if not isinstance(response, str):
         raise TypeError("response 必须是 str。")
 
-    normalized = normalize_model_output(response)
-    parsed, error = _parse_action_with_error(normalized)
+    parsed, error = _parse_action_with_error(response)
     if error is not None:
         _log_parse_failure(error, len(response))
+    return parsed
+
+
+def parse_prd_action(response: str) -> ParsedAction | None:
+    """严格解析 canonical V3 八动作文本，不执行 response adaptation。"""
+    parsed = parse_action(response)
+    if parsed is None or parsed["action_type"] not in _PRD_MODEL_ACTIONS:
+        return None
     return parsed

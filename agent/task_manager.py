@@ -22,6 +22,122 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
 
+_STEP_EXTENSION_LIMIT = 3
+
+
+@dataclass(frozen=True)
+class StepExtensionEvidence:
+    """保存 base 预算边界处的通用推进与阻断事实。"""
+
+    task_unfinished: bool
+    recent_step_succeeded: bool
+    meaningful_progress: bool
+    latest_dispatch_transition: bool
+    repeated_action_blocked: bool = False
+    no_progress_active: bool = False
+    same_strategy_retry_exhausted: bool = False
+    safety_blocked: bool = False
+    unrecoverable_error: bool = False
+
+
+@dataclass
+class ProgressDependentStepBudget:
+    """管理一次性的、有真实推进证据时最多加三步的逻辑步预算。"""
+
+    configured_max_steps: int
+    extension_granted: bool = False
+    extension_eligible: bool = False
+    extension_steps_used: int = 0
+    extension_reason: str = "base_budget_not_exhausted"
+    _evaluated: bool = False
+
+    def __post_init__(self) -> None:
+        if type(self.configured_max_steps) is not int:
+            raise TypeError("configured_max_steps 必须是 int。")
+        if self.configured_max_steps <= 0:
+            raise ValueError("configured_max_steps 必须大于 0。")
+
+    @property
+    def effective_hard_limit(self) -> int:
+        """返回当前实际硬上限，不改写配置值。"""
+        if self.extension_granted:
+            return self.configured_max_steps + _STEP_EXTENSION_LIMIT
+        return self.configured_max_steps
+
+    @property
+    def extension_steps_available(self) -> int:
+        """返回本次任务尚可使用的扩展 logical steps。"""
+        if not self.extension_granted:
+            return 0
+        return _STEP_EXTENSION_LIMIT - self.extension_steps_used
+
+    @property
+    def base_budget_exhausted(self) -> bool:
+        """返回是否已经在 base 边界完成过唯一判定。"""
+        return self._evaluated
+
+    def evaluate(self, evidence: StepExtensionEvidence) -> bool:
+        """在 base 边界执行唯一一次资格判定并返回是否授权。"""
+        if not isinstance(evidence, StepExtensionEvidence):
+            raise TypeError("evidence 必须是 StepExtensionEvidence。")
+        if self._evaluated:
+            self.extension_reason = "extension_already_evaluated"
+            return False
+        self._evaluated = True
+        checks = (
+            (evidence.task_unfinished, "task_already_completed"),
+            (evidence.recent_step_succeeded, "latest_logical_step_failed"),
+            (evidence.meaningful_progress, "no_recent_meaningful_progress"),
+            (
+                evidence.latest_dispatch_transition,
+                "latest_dispatch_has_no_real_state_transition",
+            ),
+            (not evidence.repeated_action_blocked, "repeated_action_block_active"),
+            (not evidence.no_progress_active, "no_progress_active"),
+            (
+                not evidence.same_strategy_retry_exhausted,
+                "same_strategy_retry_exhausted",
+            ),
+            (not evidence.safety_blocked, "safety_blocked"),
+            (not evidence.unrecoverable_error, "unrecoverable_execution_error"),
+        )
+        for passed, reason in checks:
+            if not passed:
+                self.extension_reason = reason
+                return False
+        self.extension_eligible = True
+        self.extension_granted = True
+        self.extension_reason = "recent_measurable_progress"
+        return True
+
+    def begin_step(self, step_number: int) -> None:
+        """记录扩展区间内实际开始的 logical step。"""
+        if type(step_number) is not int:
+            raise TypeError("step_number 必须是 int。")
+        if step_number <= self.configured_max_steps:
+            return
+        if not self.extension_granted:
+            raise ValueError("未授权 extension 时不得开始扩展步骤。")
+        if step_number > self.effective_hard_limit:
+            raise ValueError("step_number 超过 effective hard limit。")
+        expected = self.configured_max_steps + self.extension_steps_used + 1
+        if step_number != expected:
+            raise ValueError("扩展步骤必须连续且只记录一次。")
+        self.extension_steps_used += 1
+
+    def trace_fields(self) -> dict[str, object]:
+        """返回统一的 step-budget trace 字段。"""
+        return {
+            "configured_max_steps": self.configured_max_steps,
+            "base_budget_exhausted": self.base_budget_exhausted,
+            "extension_eligible": self.extension_eligible,
+            "extension_granted": self.extension_granted,
+            "extension_steps_available": self.extension_steps_available,
+            "extension_steps_used": self.extension_steps_used,
+            "effective_hard_limit": self.effective_hard_limit,
+            "extension_reason": self.extension_reason,
+        }
+
 
 class TaskStatus(str, Enum):
     """枚举单任务允许的四种生命周期状态。

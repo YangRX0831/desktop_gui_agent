@@ -1,3 +1,7 @@
+# 以下包按 PRD 规定的独立 PyTorch/CUDA 安装流程先行安装(选择与本机
+# CUDA 匹配的版本),故不作为 active 依赖行写入本清单:
+#   torch / torchvision / torchaudio
+# 具体安装步骤见 README.md「环境安装」。
 transformers>=4.40.0
 accelerate>=0.30.0
 bitsandbytes>=0.43.0

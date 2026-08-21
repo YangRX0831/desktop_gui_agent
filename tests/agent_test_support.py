@@ -1,18 +1,28 @@
 """Agent 测试共享设施:fake 后端/控制器与 Agent 组装。"""
 
+import os
+import tempfile
 from collections import deque
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Sequence
 
 import pytest
 from PIL import Image
 
 from agent.action_dispatcher import ActionDispatcher
 from agent.action_parser import ParsedAction
+from agent.agent_trace import AgentTraceWriterProtocol
 from agent.dashscope_api_backend import DashScopeAPIBackend
-from agent.gui_agent import GuiAgent, GuiAgentDependencies
-from agent.model_client import ModelClient, Qwen2VLLocalBackend
+from agent.diagnostics import DiagnosticsWriterProtocol
+from agent.gui_agent import GuiAgent, GuiAgentDependencies, ModelClientProtocol
+from agent.model_client import (
+    ModelBackend,
+    ModelCallOptions,
+    ModelClient,
+    Qwen2VLLocalBackend,
+)
 from agent.task_manager import TaskManager
 from config import DEFAULT_MAX_STEPS, DEFAULT_RETRY_COUNT, GuiAgentSettings
+from perception.prompt_context import OCRRecognizerProtocol
 
 
 class RecordingBackend:
@@ -28,7 +38,13 @@ class RecordingBackend:
         self._exc = raise_exc
         self.calls = 0
 
-    def generate(self, image: Image.Image, prompt: str) -> str:
+    def generate(
+        self,
+        image: Image.Image,
+        prompt: str,
+        options: ModelCallOptions | None = None,
+        **kwargs: object,
+    ) -> str:
         self.calls += 1
         if self._exc is not None:
             raise self._exc
@@ -111,10 +127,10 @@ class FrameSequenceCapture:
 
 
 def make_agent(
-    backend: object,
+    backend: ModelClientProtocol,
     controls: MemoryControls,
     manager: TaskManager,
-    capture: object | None = None,
+    capture: Callable[..., Image.Image] | None = None,
     *,
     max_steps: int = DEFAULT_MAX_STEPS,
     retry_count: int = DEFAULT_RETRY_COUNT,
@@ -123,7 +139,13 @@ def make_agent(
     verify_action_effect: bool = False,
     protect_initial_foreground: bool = False,
     action_observer: Callable[[int, ParsedAction], None] | None = None,
-    ocr_recognizer: object | None = None,
+    ocr_recognizer: OCRRecognizerProtocol | None = None,
+    diagnostics_writer: DiagnosticsWriterProtocol | None = None,
+    decision_protocol_v2: bool = False,
+    decision_protocol_v3: bool = False,
+    hide_own_window: bool = False,
+    semantic_execution: bool = False,
+    trace_writer: AgentTraceWriterProtocol | None = None,
 ) -> GuiAgent:
     """通过 production 公共构造路径组装完全内存化的 Agent。"""
     dependencies = GuiAgentDependencies(
@@ -135,6 +157,8 @@ def make_agent(
         protect_initial_foreground=protect_initial_foreground,
         action_observer=action_observer,
         ocr_recognizer=ocr_recognizer,
+        diagnostics_writer=diagnostics_writer,
+        trace_writer=trace_writer,
     )
     settings = GuiAgentSettings(
         max_steps=max_steps,
@@ -142,13 +166,36 @@ def make_agent(
         model_mode=model_mode,  # type: ignore[arg-type]
         reject_initial_finish=reject_initial_finish,
         verify_action_effect=verify_action_effect,
+        decision_protocol_v2=decision_protocol_v2,
+        decision_protocol_v3=decision_protocol_v3,
+        hide_own_window_during_run=hide_own_window,
+        semantic_execution=semantic_execution,
     )
     return GuiAgent(dependencies, settings)
 
 
-def _make_client(local: object, api: object, *, authorized: bool) -> ModelClient:
+def make_semantic_agent(
+    responses: Sequence[object],
+    *,
+    max_steps: int = 3,
+    reject_initial_finish: bool = False,
+) -> GuiAgent:
+    """组装启用 canonical V3 与 semantic execution 的内存 Agent。"""
+    return make_agent(
+        SequenceBackend(responses),
+        MemoryControls(),
+        TaskManager("任务"),
+        max_steps=max_steps,
+        retry_count=0,
+        model_mode="api",
+        reject_initial_finish=reject_initial_finish,
+        decision_protocol_v3=True,
+        semantic_execution=True,
+    )
+
+
+def _make_client(local: ModelBackend, api: ModelBackend) -> ModelClient:
     client = ModelClient(local, api, fallback_enabled=True)
-    client.set_run_fallback_authorization(authorized)
     return client
 
 
@@ -275,9 +322,13 @@ def _install_fake_transformers(
             return _FakeModel()
 
     module = types.ModuleType("transformers")
-    module.AutoProcessor = _FakeAutoProcessor
-    module.Qwen2VLForConditionalGeneration = _FakeQwen2VL
-    module.BitsAndBytesConfig = _FakeBitsAndBytesConfig
+    module.AutoProcessor = _FakeAutoProcessor  # type: ignore[attr-defined]  # 假模块
+    module.Qwen2VLForConditionalGeneration = (  # type: ignore[attr-defined]  # 假模块
+        _FakeQwen2VL
+    )
+    module.BitsAndBytesConfig = (  # type: ignore[attr-defined]  # 假模块
+        _FakeBitsAndBytesConfig
+    )
     monkeypatch.setitem(sys.modules, "transformers", module)
 
     def _stub_read(_self, _path):
@@ -354,9 +405,11 @@ def _make_timeline(*entries: tuple[int, str]) -> deque:
     return _deque(entries, maxlen=8)
 
 
-# Qwen2-VL 本地后端目录校验测试使用的真实模型目录。
-_REAL_MODEL_DIR = (
-    r"C:\AI\Models\Qwen2-VL-2B-Instruct\895c3a49bc3fa70a340399125c650a463535e71c"
+# Qwen2-VL 本地后端测试使用的模型目录占位。构造校验目录存在、真实加载被
+# fake transformers 替换,磁盘内容不被读取;环境变量可指向真实目录做联调。
+_REAL_MODEL_DIR = os.environ.get(
+    "GUI_AGENT_TEST_MODEL_DIR",
+    tempfile.gettempdir(),
 )
 
 # GuiAgent 每个run授予的副作用动作白名单(与 gui_agent 实现保持一致)。
@@ -395,7 +448,7 @@ class SequenceBackend:
     记录每次收到的完整 prompt 供断言;mode 参数兼容 ModelClient 合同。
     """
 
-    def __init__(self, responses: list[object]) -> None:
+    def __init__(self, responses: Sequence[object]) -> None:
         self._responses = list(responses)
         self._index = 0
         self.prompts: list[str] = []
@@ -406,6 +459,8 @@ class SequenceBackend:
         image: object,
         prompt: str,
         mode: str = "local",
+        options: ModelCallOptions | None = None,
+        **kwargs: object,
     ) -> str:
         self.calls += 1
         self.prompts.append(prompt)

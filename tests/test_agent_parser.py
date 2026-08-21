@@ -5,7 +5,12 @@ import asyncio
 import pytest
 from agentscope.message import Msg
 
-from agent.action_parser import parse_action
+from agent.action_parser import (
+    CANONICAL_V3_ACTIONS,
+    classify_prd_action_parse_error,
+    parse_action,
+    parse_prd_action,
+)
 from agent.task_manager import TaskManager
 from main import _format_action
 from tests.agent_test_support import MemoryControls, SequenceBackend, make_agent
@@ -39,6 +44,18 @@ def test_type_parser_preserves_json_string_escapes() -> None:
     assert action == {
         "action_type": "type",
         "params": {"text": 'line 1\n"quoted"\\tail'},
+    }
+
+
+def test_type_parser_restores_structured_grid_delimiters() -> None:
+    """JSON 转义的 Tab/换行恢复为控制语义，并保留最终提交 Tab。"""
+    action = parse_action(
+        r'Action: type(text="alpha\tbeta\tgamma\none\ttwo\tthree\t")',
+    )
+
+    assert action == {
+        "action_type": "type",
+        "params": {"text": "alpha\tbeta\tgamma\none\ttwo\tthree\t"},
     }
 
 
@@ -198,31 +215,88 @@ def test_extended_actions_reject_invalid(response: str) -> None:
     assert parse_action(response) is None
 
 
-def test_normalize_model_output_fixes_prefix_variants() -> None:
-    """小模型常见前缀偏差经归一化后可被严格 parser 接受。"""
-    from agent.action_parser import normalize_model_output, parse_action
+@pytest.mark.parametrize(
+    "response",
+    [
+        "Action: right_click(x=100, y=200)",
+        "Action: double_click(x=100, y=200)",
+        "Action: drag(x1=10, y1=20, x2=30, y2=40)",
+    ],
+)
+def test_v3_strict_parser_accepts_restored_actions(response: str) -> None:
+    """ACTION-CONTRACT-002 的三个恢复动作通过 V3 strict parser。"""
+    assert parse_prd_action(response) is not None
+    assert classify_prd_action_parse_error(response) is None
 
-    cases = [
-        ("1. click(x=500, y=1000)", "Action: click(x=500, y=1000)"),
-        ('2. type(text="hello")', 'Action: type(text="hello")'),
-        ('3. finish(result="done")', 'Action: finish(result="done")'),
-        ("click(x=100, y=200)", "Action: click(x=100, y=200)"),
-        ("Action: click(x=1, y=2)", "Action: click(x=1, y=2)"),
-        ("random text", "random text"),
-        ('8. hotkey(key1="win")', 'Action: hotkey(key1="win")'),
-    ]
-    for raw, expected in cases:
-        assert normalize_model_output(raw) == expected, raw
 
-    assert parse_action("1. click(x=500, y=1000)") == {
-        "action_type": "click",
-        "params": {"x": 500, "y": 1000},
+@pytest.mark.parametrize(
+    "response",
+    [
+        "Action: right_click(x=100)",
+        "Action: right_click(x=100, y=200, y=201)",
+        "Action: double_click(x=100, y=200, extra=1)",
+        "Action: drag(x1=10, y1=20, x2=30)",
+        "Action: drag(x1=10, y1=20, x2=30, y2=40, x2=31)",
+        "Action: drag(10, 20, 30, 40)",
+        "Action: observe()",
+    ],
+)
+def test_v3_strict_parser_rejects_invalid_restored_actions(response: str) -> None:
+    """恢复动作缺参、重复、额外、位置参数与 observe 均 fail closed。"""
+    assert parse_prd_action(response) is None
+    assert classify_prd_action_parse_error(response) is not None
+
+
+def test_canonical_v3_action_set_is_exact() -> None:
+    """V3 权威动作集合恰为人工裁决的八动作且不含内部原语。"""
+    assert CANONICAL_V3_ACTIONS == (
+        "click",
+        "right_click",
+        "double_click",
+        "drag",
+        "type",
+        "scroll",
+        "hotkey",
+        "finish",
+    )
+
+
+@pytest.mark.parametrize(
+    "response",
+    [
+        " Action: click(x=450, y=485)",
+        "Action: click(x=450, y=485) ",
+        "click(x=450, y=485)",
+        "1. click(x=450, y=485)",
+        "Action: click(x=0.5, y=0.5)",
+        'Action: hotkey(key="enter")',
+        "Action: hotkey(ctrl, n)",
+        "Action: type(text='hello')",
+        "Action: scroll(direction='down', steps=3)",
+        "Action: click(450, 485)",
+        "Action: click(x=450, 485)",
+        "Action: click(x=450)",
+        "Action: click(x=450, )",
+        "Action: click(x=450,485)",
+        "Action: click(x=450, 485, 486)",
+        "Action: click(x=450, y=485, 486)",
+        "Action: click(x=450, 48.5)",
+        "Action: click(y=450, 485)",
+        "Action: right_click(x=450, 485)",
+        "Action: double_click(x=450, 485)",
+        "Action: drag(1, 2, 3, 4)",
+    ],
+)
+def test_strict_parser_rejects_all_noncanonical_shapes(response: str) -> None:
+    """Adapter 之外的 strict parser 不接受任何表示修复或歧义输入。"""
+    assert parse_action(response) is None
+
+
+def test_strict_parser_preserves_canonical_string_content() -> None:
+    """Canonical JSON 字符串中的单引号属于正文，不触发任何改写。"""
+    raw = "Action: finish(result=\"已输入'Hello World'\")"
+
+    assert parse_action(raw) == {
+        "action_type": "finish",
+        "params": {"result": "已输入'Hello World'"},
     }
-    assert parse_action('2. type(text="hello")') == {
-        "action_type": "type",
-        "params": {"text": "hello"},
-    }
-    assert parse_action('5. finish(result="done")') is not None
-    # 非法内容归一化后仍被 parser 拒绝
-    assert parse_action("1. click(x=abc, y=def)") is None
-    assert parse_action("1. unknown_action(x=1)") is None
