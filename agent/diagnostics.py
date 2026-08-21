@@ -2,16 +2,16 @@
 
 职责：
     仅在模型调用失败或动作解析失败时，把 prompt、模型响应原文和当步截图
-    落盘到 ``logs/diagnosis/`` 下的 JSONL 与 PNG，供失败归因使用。成功响应
-    不记录；业务日志（StreamHandler/Formatter 输出层）的隐私禁令不变。
+    写入 ``logs/diagnosis/`` 下的 JSONL 与 PNG 文件，供问题定位使用。成功
+    响应不记录，常规业务日志仍保持脱敏输出。
 
-隐私边界（AGENTS.md §9.2 诊断文件例外）：
-    诊断文件可以包含 prompt 文本、模型响应和截图；凭据类（密码、Token、
-    API Key 等）仍然硬禁。产物只保存在本地被 Git 忽略的目录，手动分享前
-    需要脱敏。
+隐私边界：
+    诊断文件可能包含 prompt、模型响应和截图，因此仅应保存在本地受控目录。
+    本写入器不对这些内容自动执行凭据过滤；调用方不得传入密码、Token、
+    API Key 等敏感信息，手动分享诊断文件前也应再次检查并脱敏。
 
 失败安全：
-    写入失败只记安全日志（异常类型），不向调用方抛出，不影响主任务流程。
+    写入失败只记录异常类型，不向调用方抛出，也不影响主任务流程。
 """
 
 import json
@@ -29,28 +29,28 @@ _DIAGNOSIS_SUBDIR = "diagnosis"
 
 
 class DiagnosticsWriterProtocol(Protocol):
-    """定义编排器需要的最小诊断合同。
+    """定义编排器需要的最小诊断写入接口。
 
-    ``ActionDiagnosticsWriter`` 是 production 实现；测试可注入内存 fake，
-    None 表示不启用诊断。
+    ``ActionDiagnosticsWriter`` 是默认实现；测试可注入内存实现，None 表示
+    不启用诊断。
     """
 
     def record(self, record: "DiagnosticsRecord") -> None:
-        """落盘单个失败事件。"""
+        """写入单个失败事件。"""
 
 
 @dataclass(frozen=True)
 class DiagnosticsRecord:
-    """单个失败事件的诊断数据。
+    """保存单个失败事件的诊断数据。
 
     Attributes:
-        run_id: 任务运行标识，用于把同一 run 的事件归入同一 JSONL。
+        run_id: 任务运行标识，用于把同一运行的事件归入同一 JSONL。
         step_number: 失败发生的逻辑步骤号（从 1 开始）。
-        attempt: 步内尝试序号（从 0 开始，0 为 initial attempt）。
+        attempt: 步内尝试序号（从 0 开始，0 为首次尝试）。
         image: 失败时使用的模型输入截图。
         prompt: 失败时发送的完整 prompt 文本。
         response: 模型响应原文；模型调用抛异常时为 None。
-        failure_reason: 既有的失败原因常量（含解析失败分类）。
+        failure_reason: 失败原因摘要。
         exception_type: 模型调用抛出的异常类型名；无异常时为 None。
     """
 
@@ -65,7 +65,7 @@ class DiagnosticsRecord:
 
 
 class ActionDiagnosticsWriter:
-    """把失败事件追加写入本地诊断目录的写入器。"""
+    """把失败事件追加写入本地诊断目录。"""
 
     def __init__(self, log_dir: Path) -> None:
         """初始化写入器。
@@ -81,16 +81,16 @@ class ActionDiagnosticsWriter:
         self._dir = log_dir / _DIAGNOSIS_SUBDIR
 
     def record(self, record: DiagnosticsRecord) -> None:
-        """把单个失败事件落盘为 JSONL 行与 PNG 截图。
+        """把单个失败事件写为 JSONL 记录和 PNG 截图。
 
-        目录懒创建，写入失败只记安全日志不抛出；参数错误在写入前抛出。
+        目录按需创建，写入失败只记录异常类型；参数错误在写入前抛出。
 
         Args:
             record: 已由调用方组装的失败事件数据。
 
         Raises:
-            TypeError: 字段类型不符合合同。
-            ValueError: run_id、failure_reason 为空或步骤号非正。
+            TypeError: 字段类型不符合约定。
+            ValueError: run_id、failure_reason 为空或步骤号无效。
         """
         self._validate_record(record)
         screenshot_name = (
