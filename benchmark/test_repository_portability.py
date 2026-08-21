@@ -78,6 +78,19 @@ def test_local_runner_uses_environment_model_dir(monkeypatch, tmp_path: Path) ->
     assert captured["GUI_AGENT_OPENVINO_MODEL_DIR"] == model_dir
 
 
+def test_timeout_defaults_follow_task_difficulty() -> None:
+    """未显式覆盖时，简单任务与中高难度任务应使用各自默认超时。"""
+    assert paired_runner.resolve_task_timeout("S01", None) == 480
+    assert paired_runner.resolve_task_timeout("M01", None) == 1000
+    assert paired_runner.resolve_task_timeout("H01", None) == 1000
+
+
+def test_timeout_override_has_priority() -> None:
+    """命令行显式超时应覆盖按难度选择的默认值。"""
+    assert paired_runner.resolve_task_timeout("S01", 123.0) == 123.0
+    assert paired_runner.resolve_task_timeout("H01", 123.0) == 123.0
+
+
 def test_windows_launcher_scripts_are_portable() -> None:
     """仓库应包含无密钥、无机器路径的 API 与本地模型启动脚本。"""
     for name in ("run_api.bat", "run_local.bat"):
