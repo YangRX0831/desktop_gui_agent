@@ -1,11 +1,9 @@
-"""LOCAL-ONLY Compact Action Prompt(键盘优先,仅 model_mode=local 使用)。
+"""本地模型专用的紧凑动作提示词，采用键盘优先策略。
 
-设计目标(2026-08-19 LOCAL 2B KEYBOARD-FIRST BASELINE):
-    Local 2B 已被诊断:文字读取/任务语义可用,连续坐标 grounding 与
-    候选选择不可靠。本 Prompt 删除 windows Z 序/长历史,只保留必要状态、
-    当轮有界候选与通用键盘优先策略,把策略空间聚焦到可靠键盘动作。
-    动作语法行由 ``action_parser.action_grammar_lines`` 从真实解析正则
-    生成(单一事实源);API Clean V3 完全不受本模块影响。
+该提示词减少非必要上下文，只保留当前执行状态、有限的 OCR 信息和交互
+候选。在可靠快捷键可以完成任务时优先使用键盘操作，降低小型本地模型对
+连续坐标定位的依赖。动作语法由 ``action_parser.action_grammar_lines``
+统一生成，API 模式不使用本模块。
 """
 
 from agent.action_parser import (
@@ -13,7 +11,7 @@ from agent.action_parser import (
     action_grammar_lines,
 )
 
-# 静态部分:一次生成;语法行源自 action_parser 真实 grammar。
+# 静态提示词只生成一次，动作语法与解析器保持一致。
 LOCAL_ACTION_SYSTEM_PROMPT = (
     "你是桌面GUI操作智能体。根据截图和当前状态，每次只输出一个动作。\n"
     "\n"
@@ -45,7 +43,7 @@ def compose_local_compact_prompt(
     state: ActionPromptState,
     coordinate_mode: str,
 ) -> str:
-    """组装 Local Compact Prompt(单文本,含静态策略+精简动态状态)。"""
+    """组装本地模型使用的紧凑提示词。"""
     if not isinstance(task, str) or not task.strip():
         raise ValueError("task 必须是非空 str。")
     if not isinstance(state, ActionPromptState):
