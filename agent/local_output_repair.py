@@ -1,17 +1,19 @@
-"""LOCAL-ONLY 输出表面修复:仅服务 model_mode == local 的 2B 模型。
+"""对本地模型输出执行确定性的表面格式修复。
 
-流程合同:LOCAL RAW → local_output_repair → Action Response Adapter
-→ 现有 strict parser。API 模式完全跳过本模块(调用方按 model_mode 门控)。
+处理链路为：本地模型原始输出 → 本模块 → Action Response Adapter → 严格
+动作解析器。API 模式由调用方直接跳过本模块。
 
-安全边界:只做确定性、无歧义、不改变动作语义的修复——
-1. 剥 Markdown fence 行(``` / ~~~ 纯标记行);
-2. 恰好一个 Action 行时提取该行(≥2 个 Action 候选保持原样交严格 parser 拒绝);
-3. 中文标点→半角(仅作用于引号外区域的 Action 语法部分,字符串参数内
-   的中文标点原样保留);
-4. 已知动作名大小写标准化(仅动词 token);
-5. 首尾空白 strip。
-严禁:多 Action 二选一、改坐标、猜参数、按任务 hardcode、放宽 common
-parser。任何无法无歧义修复的输入保持 parse failure。
+本模块只处理无歧义且不改变动作语义的表示差异：
+1. 删除纯 Markdown fence 标记行；
+2. 全文恰好存在一个 Action 行时提取该行；
+3. 仅在字符串之外把中文语法标点转换为半角；
+4. 将已知动作名的大小写规范为小写；
+5. 规范首尾空白；
+6. 在参数名及顺序与动作签名完全一致时补齐括号形式。
+
+不得在多个动作之间选择，不修改坐标，不猜测缺失参数，不根据任务内容
+硬编码结果，也不放宽公共解析器。无法确定修复结果时保持原文，由严格解析器
+拒绝。
 """
 
 import re
@@ -37,7 +39,7 @@ _ACTION_VERB = re.compile(
     r"^(?P<prefix>\s*(?:\d+[.、)]\s*)?[Aa][Cc][Tt][Ii][Oo][Nn]\s*[:：]\s*)"
     r"(?P<verb>[A-Za-z_]+)(?P<rest>\()",
 )
-# 中文标点→半角:仅引号外片段执行;全角冒号/逗号/圆括号。
+# 仅在引号外替换 Action 语法中的全角冒号、逗号和圆括号。
 _CJK_PUNCT_MAP = {
     "：": ":",
     "，": ",",
@@ -47,13 +49,13 @@ _CJK_PUNCT_MAP = {
 
 
 def _strip_fence_lines(text: str) -> str:
-    """删除纯 Markdown fence 标记行;内部内容逐行原样保留。"""
+    """删除纯 Markdown fence 标记行，内部内容按行原样保留。"""
     lines = [line for line in text.split("\n") if not _FENCE_LINE.match(line)]
     return "\n".join(lines)
 
 
 def _extract_unique_action_line(text: str) -> str:
-    """全文恰有一个 Action 行时返回该行;否则原样返回。"""
+    """全文恰有一个 Action 行时返回该行，否则原样返回。"""
     action_lines = [line for line in text.split("\n") if _ACTION_LINE.match(line)]
     if len(action_lines) == 1:
         return action_lines[0].strip()
@@ -61,11 +63,10 @@ def _extract_unique_action_line(text: str) -> str:
 
 
 def _fix_punct_outside_strings(text: str) -> str:
-    """把中文语法标点替换为半角;双引号字符串内部不动。
+    """把中文语法标点替换为半角，同时保留双引号字符串内部内容。
 
-    以半角双引号为界交替划分引号外/内片段;Action 语法的关键字符
-    (冒号/逗号/括号)只出现在引号外,参数字符串内的中文标点由此
-    得到完整保护。
+    以半角双引号为界交替划分字符串外与字符串内片段。Action 语法关键字符
+    只在字符串外规范化，因此文本参数中的中文标点不会被改写。
     """
     parts = text.split('"')
     rebuilt = []
@@ -73,19 +74,18 @@ def _fix_punct_outside_strings(text: str) -> str:
         if index % 2 == 0:
             for cjk, ascii_punct in _CJK_PUNCT_MAP.items():
                 part = part.replace(cjk, ascii_punct)
-            # 中文逗号替换后无空格;协议要求"逗号后一个空格",把引号外
-            # 的逗号后空白统一收敛为恰好一个空格(确定性,不动字符串内)。
+            # 协议要求参数逗号后使用一个空格；只处理字符串外片段。
             part = re.sub(r",\s*", ", ", part)
         rebuilt.append(part)
     result = '"'.join(rebuilt)
-    # Action 末尾的中文句号:只剥"最后一个引号外字符且其前是右括号"的形态。
+    # 只移除完整动作右括号后的中文句号，不处理参数字符串中的句号。
     if result.endswith("。") and result[:-1].rstrip().endswith(")"):
         result = result[:-1].rstrip()
     return result
 
 
 def _fix_action_verb_case(text: str) -> str:
-    """把已知动作名 token 标准化为小写;坐标与参数不动。"""
+    """把已知动作名规范为小写，参数和值保持不变。"""
     match = _ACTION_VERB.match(text)
     if match is None:
         return text
@@ -108,11 +108,11 @@ _PARAM_PART = re.compile(r"^\s*([A-Za-z_]\w*)\s*=\s*(.+?)\s*$")
 
 
 def _wrap_comma_named_params(text: str) -> str:
-    """``Action: click, x=100, y=200`` → ``Action: click(x=100, y=200)``。
+    """将逗号参数形式转换为标准括号形式。
 
-    仅当:单行唯一 Action;动词已知;参数名序列与该动作合法 signature
-    完全一致;无多余 token;所有参数值原样保留。否则原样返回交严格
-    parser 拒绝(缺参数/未知参数/改语义一律不修)。
+    例如 ``Action: click, x=100, y=200`` 可转换为
+    ``Action: click(x=100, y=200)``。只有在动作已知、参数名序列与合法签名
+    完全一致且没有多余内容时才转换；否则原样交给严格解析器。
     """
     match = _COMMA_ACTION.match(text)
     if match is None:
@@ -122,7 +122,7 @@ def _wrap_comma_named_params(text: str) -> str:
     if signature is None:
         return text
     body = match.group("body")
-    # 引号感知的顶层逗号切分:字符串参数内部的逗号属于参数值。
+    # 按引号状态切分顶层逗号，避免把字符串参数内部逗号当作参数分隔符。
     parts = []
     current = []
     in_quote = False
@@ -150,14 +150,14 @@ def _wrap_comma_named_params(text: str) -> str:
 
 
 def repair_local_output(response: str) -> tuple[str, list[str]]:
-    """对 local 模型原始输出做确定性表面修复。
+    """对本地模型原始输出执行确定性表面修复。
 
     Args:
         response: 模型返回的原始文本。
 
     Returns:
-        (修复后文本, 使用的修复类型列表);修复按固定顺序执行,
-        任何一步不确定即保持原样交由严格 parser 裁决。
+        修复后文本与已应用修复类型列表。各规则按固定顺序执行；不能确定的
+        表示保持原样，由严格解析器决定是否接受。
 
     Raises:
         TypeError: response 不是 str。
