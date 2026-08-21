@@ -11,11 +11,11 @@ Desktop GUI Agent 是一个面向 Windows 桌面环境的多模态图形用户�
 - 鼠标点击、右键、双击、拖拽和滚动
 - 键盘文本输入与组合键操作
 - 多步骤任务执行与失败恢复
-- API / Local 双模式运行
+- API 与本地模型双模式运行
 - 动作格式规范化与严格解析
 - 前台窗口保护与安全检查
 - 执行过程日志与问题诊断
-- 单元测试、回归测试和质量检查
+- 单元测试、回归测试和代码质量检查
 
 ## 运行环境
 
@@ -45,6 +45,12 @@ $env:DASHSCOPE_API_MODEL = "<model-name>"
 python -B main.py --model-mode api
 ```
 
+Windows 下也可使用仓库中的快捷启动脚本：
+
+```powershell
+.\run_api.bat
+```
+
 ## 本地模型模式
 
 ### Transformers
@@ -61,6 +67,12 @@ python -B main.py --model-mode local
 $env:GUI_AGENT_LOCAL_RUNTIME = "openvino"
 $env:GUI_AGENT_OPENVINO_MODEL_DIR = "C:\path\to\openvino-model"
 python -B main.py --model-mode local
+```
+
+Windows 下也可在完成环境变量配置后使用：
+
+```powershell
+.\run_local.bat
 ```
 
 ## 支持的动作类型
@@ -88,17 +100,9 @@ finish
 python -B tools/run_checks.py --all --report
 ```
 
-该命令包括：
+该命令包括项目测试、Benchmark 测试框架自检、mypy 类型检查、Black 格式检查、isort 导入顺序检查、flake8 代码规范检查和 Git 空白字符检查，不会自动执行真实桌面 GUI 任务。
 
-- 项目单元测试与回归测试
-- Benchmark 测试框架自检
-- mypy 类型检查
-- Black 格式检查
-- isort 导入顺序检查
-- flake8 代码规范检查
-- Git diff 空白字符检查
-
-该命令不会自动执行真实桌面 GUI 任务。
+GUI 基准测试会实际操作 Windows 桌面，应在独立测试环境中运行。API 基准测试使用仓库内的 `run_api.bat` 启动程序；本地 OpenVINO 配对测试需要预先配置 `GUI_AGENT_OPENVINO_MODEL_DIR`，不依赖任何开发机固定路径。
 
 ## 项目结构
 
