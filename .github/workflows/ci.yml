@@ -30,7 +30,9 @@ jobs:
         run: python -m pip install flake8 && python -m flake8 --max-line-length=88 --extend-ignore=E203,W503 agent perception control utils tools main.py config.py verify_env.py tests benchmark
 
   mypy-production:
-    runs-on: ubuntu-latest
+    # 生产代码包含 Windows 专用 ctypes API；Windows runner 才能使用与目标
+    # 平台一致的 typeshed 定义，避免 Linux 上对 windll/WinDLL 的伪报错。
+    runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
