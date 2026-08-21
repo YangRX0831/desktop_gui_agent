@@ -1,20 +1,12 @@
 """提供基于 PP-OCRv4 的桌面图像文字识别适配。
 
-职责：
-    延迟创建 PRD 指定的 PP-OCRv4 中文 CPU 引擎，把 Pillow RGB 图像转换
-    为后端需要的 BGR uint8 数组，并统一输出文字、边界框和置信度。
+识别器延迟创建 PP-OCRv4 中文 CPU 引擎，将 Pillow RGB 图像转换为后端所需
+的 BGR ``uint8`` 数组，并把 PaddleOCR 的返回结果统一为文本、整数边界框和
+置信度。
 
-结构约束：
-    PaddleOCR 不同结果形状只能通过显式字段和长度校验进入公共格式。文本、
-    分数和框必须按索引一一对应；不完整结果作为识别失败，而非静默丢弃。
-
-坐标约束：
-    后端可能返回四坐标矩形或四点多边形。公共结果统一为包含所有点的整数
-    外接矩形，不推断旋转、DPI 或跨模块坐标转换语义。
-
-安全边界：
-    OCR 原文和图像可能包含用户数据，不写入日志。后端异常转换为项目异常
-    并保留根因；默认构造之外的测试可注入 predictor，避免加载真实模型。
+后端结果必须通过显式字段、维度和长度校验。文本、分数与位置数据按索引严格
+对应；结构不完整时报告识别错误，而不是静默丢弃部分结果。OCR 原文和图像可能
+包含用户数据，因此本模块不会把这些内容写入日志。
 """
 
 import logging
@@ -40,8 +32,6 @@ class OCRResult(TypedDict):
         text: OCR 完整文字，只在内存感知链中传递。
         bbox: 识别区域的整数外接矩形。
         confidence: 后端返回的有限浮点置信度。
-
-    ``OCRRecognizer.recognize`` 返回该结构给感知调用方。
     """
 
     text: str
@@ -50,43 +40,28 @@ class OCRResult(TypedDict):
 
 
 class OCRPredictor(Protocol):
-    """定义 OCR 推理引擎所需的最小接口。
-
-    Attributes:
-        predictor 的模型和缓存状态由实现私有管理。
-
-    默认实现是 PaddleOCR，测试实现不加载真实模型。
-    """
+    """定义 OCR 推理引擎所需的最小接口。"""
 
     def predict(
         self,
         image: np.ndarray,
     ) -> Iterable[Mapping[str, object]]:
-        """识别图像并返回可迭代的原始结果。
-
-        Args:
-            image: BGR 顺序的三通道图像数组。
-
-        Returns:
-            按推理引擎顺序产生的 OCR 原始结果。
-        """
+        """识别 BGR 三通道图像并返回可迭代的原始结果。"""
 
 
 def _create_ocr_engine() -> OCRPredictor:
-    """按冻结参数创建 PP-OCRv4 中文 CPU predictor。
+    """按项目配置创建 PP-OCRv4 中文 CPU predictor。
 
-    动态导入避免模块 import 即加载模型；任何导入或构造失败都转换为
-    ``OCRModelLoadError`` 并保留原因，不自动下载或切换后端。
+    动态导入避免模块导入时直接加载模型；构造失败统一转换为
+    ``OCRModelLoadError``，不自动下载模型或切换识别后端。
     """
     logger.info("开始初始化 PP-OCRv4 OCR 模型")
     try:
         module = import_module("paddleocr")
         paddle_ocr = module.PaddleOCR
-        # 这些 CPU 推理与检测参数（MKL-DNN、8 线程、960/max）共同影响
-        # OCR 的准确率和延迟；修改后应重新进行准确率与性能回归验证。
-        # 960 为 P5/P5B 对照实验选定:清晰文本字符准确率 0.9905,
-        # 较 736 的 0.9238 对 90% 门槛保有约 9pp 安全余量;UI 元素
-        # 命中率两者持平(0.980),736 的延迟优势不改变任何门槛判定。
+        # MKL-DNN、线程数和检测边长会共同影响准确率与延迟。当前使用 960
+        # 像素检测边长以优先保证桌面文字识别准确率；修改参数后应重新执行
+        # 准确率和性能回归验证。
         engine = paddle_ocr(
             ocr_version="PP-OCRv4",
             lang="ch",
@@ -108,10 +83,7 @@ def _create_ocr_engine() -> OCRPredictor:
 
 
 def _raise_structure_error(message: str) -> NoReturn:
-    """以统一项目异常拒绝后端结构漂移。
-
-    ``message`` 只描述固定字段合同，不能包含 OCR 原文或后端响应正文。
-    """
+    """以统一项目异常拒绝后端结构不符合预期的结果。"""
     logger.error("OCR 结果结构无效：%s", message)
     raise OCRRecognitionError(message)
 
@@ -121,10 +93,7 @@ def _read_sequence(
     field_name: str,
     array_dimensions: int,
 ) -> list[object] | tuple[object, ...]:
-    """读取结果序列并检查 NumPy 数组维度。
-
-    字符串和任意 Iterable 不被接受，避免把 OCR 正文拆成字段项。
-    """
+    """读取结果序列并检查 NumPy 数组维度。"""
     if isinstance(value, np.ndarray):
         if value.ndim != array_dimensions:
             _raise_structure_error(f"{field_name} 数组维度无效")
@@ -135,10 +104,7 @@ def _read_sequence(
 
 
 def _read_coordinate(value: object, field_name: str) -> int:
-    """把 Integral 坐标规范化为 Python int。
-
-    bool 虽属于整数体系但没有像素坐标语义，因此显式拒绝。
-    """
+    """把整数坐标规范化为 Python int，并显式拒绝 bool。"""
     if isinstance(value, bool) or not isinstance(value, Integral):
         _raise_structure_error(f"{field_name} 坐标必须是整数")
     coordinate = int(value)
@@ -146,10 +112,7 @@ def _read_coordinate(value: object, field_name: str) -> int:
 
 
 def _parse_box(value: object) -> tuple[int, int, int, int]:
-    """解析具有正面积的四坐标矩形。
-
-    这里只验证后端结构，不推断屏幕、裁剪区域或 DPI 坐标空间。
-    """
+    """解析具有正面积的四坐标矩形。"""
     coordinates = _read_sequence(value, "rec_boxes", 1)
     if len(coordinates) != 4:
         _raise_structure_error("rec_boxes 的单项必须包含四个坐标")
@@ -163,10 +126,7 @@ def _parse_box(value: object) -> tuple[int, int, int, int]:
 
 
 def _parse_polygon(value: object) -> tuple[int, int, int, int]:
-    """把非空点序列转换为覆盖全部点的外接矩形。
-
-    每个点必须精确包含两个整数；退化多边形作为结构错误处理。
-    """
+    """把非空点序列转换为覆盖全部点的整数外接矩形。"""
     points = _read_sequence(value, "rec_polys", 2)
     if not points:
         _raise_structure_error("rec_polys 的单项不能为空")
@@ -189,10 +149,7 @@ def _parse_polygon(value: object) -> tuple[int, int, int, int]:
 
 
 def _parse_confidence(value: object) -> float:
-    """把有限实数置信度规范化为 float。
-
-    不在此改变后端数值或自行建立阈值，保留 PRD 未定义的策略边界。
-    """
+    """把有限实数置信度规范化为 float。"""
     if isinstance(value, bool) or not isinstance(value, Real):
         _raise_structure_error("rec_scores 的单项必须是实数")
     confidence = float(value)
@@ -202,10 +159,7 @@ def _parse_confidence(value: object) -> float:
 
 
 def _validate_empty_positions(value: object, field_name: str) -> None:
-    """确认空文本页面没有残留位置数据。
-
-    这一区分合法空识别结果与并行字段错位，避免静默遗漏后端错误。
-    """
+    """确认空文本页面没有残留位置数据。"""
     if isinstance(value, np.ndarray):
         if value.ndim == 0:
             _raise_structure_error(f"{field_name} 数组维度无效")
@@ -219,11 +173,7 @@ def _validate_empty_positions(value: object, field_name: str) -> None:
 
 
 def _parse_page(page: object) -> list[OCRResult]:
-    """把单页后端映射转换为索引严格对齐的公共结果。
-
-    文本、置信度和位置字段长度必须一致；每项验证完成后才组装结果，
-    防止部分结构有效时返回不完整 OCR 数据。
-    """
+    """把单页后端映射转换为索引严格对齐的公共结果。"""
     if not isinstance(page, Mapping):
         _raise_structure_error("OCR 结果项必须是映射")
     if "rec_texts" not in page:
@@ -236,12 +186,10 @@ def _parse_page(page: object) -> list[OCRResult]:
     if len(texts) != len(scores):
         _raise_structure_error("rec_texts 与 rec_scores 长度不一致")
 
-    # rec_boxes 和 rec_polys 同时存在时优先使用 rec_boxes，保证同一
-    # 结果只采用一种边界框计算规则。
+    # rec_boxes 与 rec_polys 同时存在时优先使用 rec_boxes，使一项结果只采用
+    # 一种边界框计算规则。
     boxes_value = page.get("rec_boxes")
     if not texts:
-        # rec_texts 为空时位置字段也必须为空；空 NumPy 数组可以使用不同
-        # 维度，但只要包含位置数据，就视为字段长度不一致。
         for field_name in ("rec_boxes", "rec_polys"):
             positions_value = page.get(field_name)
             if positions_value is not None:
@@ -258,8 +206,7 @@ def _parse_page(page: object) -> list[OCRResult]:
     if len(texts) != len(positions):
         _raise_structure_error("文字、置信度与位置字段长度不一致")
 
-    # 输出统一为 Python 原生类型，隔离 PaddleOCR 和 NumPy 的容器细节，
-    # 使上层只依赖稳定的文本、边界框和置信度契约。
+    # 输出统一为 Python 原生类型，使上层不依赖 PaddleOCR 或 NumPy 的容器细节。
     results: list[OCRResult] = []
     for index in range(len(texts)):
         text = texts[index]
@@ -288,7 +235,7 @@ class OCRRecognizer:
         """初始化识别器。
 
         Args:
-            engine: 可选的 OCR 推理引擎；未提供时立即创建默认 OCR 引擎。
+            engine: 可选的 OCR 推理引擎；未提供时创建默认 OCR 引擎。
 
         Raises:
             OCRModelLoadError: 默认 OCR 模型初始化失败。
